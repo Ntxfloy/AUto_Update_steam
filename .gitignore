@@ -23,3 +23,5 @@ fix_db.sql
 query.sql
 чат.md
 ТЗ*
+test-steam-overlap.ps1
+_tmp/
