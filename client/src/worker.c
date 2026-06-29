@@ -71,7 +71,7 @@ static void on_log(const char *line, void *ud) {
 // Known F2P App IDs (any pool account can update these)
 // ---------------------------------------------------------------------------
 static int is_f2p_app(const char *app_id) {
-    static const char *f2p_ids[] = { "730", "578080", "252950" };  // CS2, PUBG, Rocket League
+    static const char *f2p_ids[] = { "730", "578080", "252950", "570" };  // CS2, PUBG, Rocket League, Dota 2
     for (int i = 0; i < (int)(sizeof(f2p_ids) / sizeof(f2p_ids[0])); i++) {
         if (strcmp(app_id, f2p_ids[i]) == 0) return 1;
     }
