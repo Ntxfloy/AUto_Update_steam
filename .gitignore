@@ -1,0 +1,25 @@
+# Build artifacts
+client/obj/
+client/-p/
+
+# Runtime data
+steamcmd_runtime/
+logs/
+for_opus/
+
+# Secrets
+vps-server/.env
+**/.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+vps-server/steam_club.db
+
+# Temp
+accounts_tmp.py
+fix_db.sql
+query.sql
+чат.md
+ТЗ*
