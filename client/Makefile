@@ -1,52 +1,48 @@
-# Makefile for Steam Auto-Updater client
-# Compiler: MinGW-w64 (gcc) via Strawberry Perl or standalone MinGW
-# Usage:
-#   mingw32-make          - build release  -> dist/steam_updater.exe
-#   mingw32-make debug    - build with debug info
-#   mingw32-make clean    - remove build artifacts
+# Steam Auto-Updater client - MinGW-w64 makefile
+# Build:  mingw32-make
+# Debug:  mingw32-make debug
+# Clean:  mingw32-make clean
 
-CC      = gcc
-DIST_DIR = dist
-OBJ_DIR  = obj
-TARGET   = $(DIST_DIR)/steam_updater.exe
+CC       = gcc
 SRC_DIR  = src
+OBJ_DIR  = obj
+DIST_DIR = dist
+TARGET   = $(DIST_DIR)/steam_updater.exe
 
-SRCS = $(SRC_DIR)/main.c     \
-       $(SRC_DIR)/acf.c      \
+CFLAGS   = -Wall -Wextra -O2 -DWINVER=0x0601 -D_WIN32_WINNT=0x0601
+LDFLAGS  = -mwindows -lwinhttp -lole32 -lcomctl32 -lcomdlg32
+
+SRCS = $(SRC_DIR)/main.c \
+       $(SRC_DIR)/config.c \
+       $(SRC_DIR)/acf.c \
+       $(SRC_DIR)/catalog.c \
        $(SRC_DIR)/steamcmd.c \
-       $(SRC_DIR)/api.c      \
-       $(SRC_DIR)/worker.c   \
-       $(SRC_DIR)/config.c   \
-       $(SRC_DIR)/lease.c
+       $(SRC_DIR)/api.c \
+       $(SRC_DIR)/lease.c \
+       $(SRC_DIR)/worker.c
 
-OBJS = $(patsubst $(SRC_DIR)/%.c, $(OBJ_DIR)/%.o, $(SRCS))
-
-CFLAGS  = -Wall -Wextra -O2 -DWINVER=0x0601 -D_WIN32_WINNT=0x0601
-LDFLAGS = -mwindows -lwinhttp -lole32 -lcomctl32 -lcomdlg32
-
-# Debug build
-DEBUG_CFLAGS = -Wall -Wextra -g -DDEBUG -DWINVER=0x0601 -D_WIN32_WINNT=0x0601
+OBJS = $(patsubst $(SRC_DIR)/%.c,$(OBJ_DIR)/%.o,$(SRCS))
 
 .PHONY: all debug clean
 
-all: $(OBJ_DIR) $(DIST_DIR) $(TARGET)
+all: $(TARGET)
 
-debug: CFLAGS = $(DEBUG_CFLAGS)
-debug: $(OBJ_DIR) $(DIST_DIR) $(TARGET)
+$(TARGET): $(OBJS) | $(DIST_DIR)
+	$(CC) $(OBJS) -o $@ $(LDFLAGS)
 
-$(OBJ_DIR):
-	if not exist $(OBJ_DIR) mkdir $(OBJ_DIR)
-
-$(DIST_DIR):
-	if not exist $(DIST_DIR) mkdir $(DIST_DIR)
-
-$(OBJ_DIR)/%.o: $(SRC_DIR)/%.c
+$(OBJ_DIR)/%.o: $(SRC_DIR)/%.c | $(OBJ_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(TARGET): $(OBJS)
-	$(CC) $(OBJS) -o $@ $(LDFLAGS)
-	@echo "=== Built: $(TARGET) ==="
+$(OBJ_DIR):
+	-mkdir $(OBJ_DIR)
+
+$(DIST_DIR):
+	-mkdir $(DIST_DIR)
+
+debug: CFLAGS += -g -O0 -DDEBUG
+debug: LDFLAGS := $(filter-out -mwindows,$(LDFLAGS))
+debug: clean all
 
 clean:
-	if exist $(OBJ_DIR) rmdir /s /q $(OBJ_DIR)
-	if exist $(DIST_DIR) rmdir /s /q $(DIST_DIR)
+	-del /Q $(OBJ_DIR)\*.o 2>nul
+	-del /Q $(DIST_DIR)\steam_updater.exe 2>nul
