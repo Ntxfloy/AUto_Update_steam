@@ -1,5 +1,6 @@
 // main.c - Steam Auto-Updater client, Win32 GUI entry point
 // Native Win32 UI: no external frameworks, single .exe
+// v3: dark theme, owner-drawn controls, sequential queue
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <commctrl.h>
@@ -29,9 +30,38 @@
 #define ID_BTN_UPDATE_ALL  108
 #define ID_BTN_REFRESH     109
 #define ID_QUEUE_TEXT      110
+#define ID_TITLE_TEXT      111
 #define ID_TIMER_REFRESH   1001
 
 #define MAX_ROWS 128
+
+// ---------------------------------------------------------------------------
+// Dark palette
+// ---------------------------------------------------------------------------
+#define CLR_BG            RGB(24,  24,  27)
+#define CLR_PANEL         RGB(32,  32,  38)
+#define CLR_PANEL_ALT     RGB(40,  40,  47)
+#define CLR_BORDER        RGB(58,  58,  66)
+#define CLR_TEXT          RGB(233, 233, 238)
+#define CLR_TEXT_DIM      RGB(148, 148, 160)
+#define CLR_ACCENT        RGB(56,  120, 220)
+#define CLR_ACCENT_HOVER  RGB(78,  146, 246)
+#define CLR_ACCENT_DOWN   RGB(40,  96,  184)
+#define CLR_OK            RGB(64,  192, 112)
+#define CLR_FAIL          RGB(238, 92,  92)
+#define CLR_WARN          RGB(230, 176, 64)
+
+// Undocumented-but-stable DWM attribute for a dark title bar.
+// Loaded dynamically so the exe still starts on Windows 7/8.
+#define DWMWA_USE_IMMERSIVE_DARK_MODE_OLD 19
+#define DWMWA_USE_IMMERSIVE_DARK_MODE     20
+
+static HBRUSH g_br_bg        = NULL;
+static HBRUSH g_br_panel     = NULL;
+static HBRUSH g_br_panel_alt = NULL;
+static HFONT  g_font_ui      = NULL;
+static HFONT  g_font_bold    = NULL;
+static HFONT  g_font_mono    = NULL;
 
 // ---------------------------------------------------------------------------
 // UI model
@@ -44,13 +74,16 @@ typedef struct {
     char status[64];
     int  installed;
     int  is_f2p;
+    int  result;      // 0 = none, 1 = ok, 2 = failed, 3 = in progress
 } GameRow;
 
 static HWND          g_hwnd           = NULL;
 static HWND          g_list           = NULL;
+static HWND          g_title_txt      = NULL;
 static HWND          g_btn_update     = NULL;
 static HWND          g_btn_update_all = NULL;
 static HWND          g_btn_refresh    = NULL;
+static HWND          g_btn_settings   = NULL;
 static HWND          g_btn_abort      = NULL;
 static HWND          g_progress       = NULL;
 static HWND          g_status_txt     = NULL;
@@ -73,6 +106,11 @@ static int           g_current_row     = -1;
 static int           g_ok_count        = 0;
 static int           g_fail_count      = 0;
 
+// Progress bar state (drawn by us)
+static double        g_pct             = 0.0;
+static char          g_pct_label[128]  = {0};
+static int           g_pct_failed      = 0;
+
 // ---------------------------------------------------------------------------
 // Forward declarations
 // ---------------------------------------------------------------------------
@@ -84,6 +122,7 @@ static void      UpdateUIFromWorker(void);
 static void      ShowSettingsDialog(HWND parent);
 static void      AppendLog(const char *line);
 static void      SetQueueText(void);
+static void      SetProgress(double pct, const char *label, int failed);
 
 static const char *state_name(WorkerState s) {
     switch (s) {
@@ -99,6 +138,122 @@ static const char *state_name(WorkerState s) {
 }
 
 // ---------------------------------------------------------------------------
+// Dark theming helpers
+// ---------------------------------------------------------------------------
+static void enable_dark_titlebar(HWND hwnd) {
+    HMODULE dwm = LoadLibraryA("dwmapi.dll");
+    if (!dwm) return;
+    typedef HRESULT (WINAPI *SetAttrFn)(HWND, DWORD, LPCVOID, DWORD);
+    SetAttrFn set_attr = (SetAttrFn)GetProcAddress(dwm, "DwmSetWindowAttribute");
+    if (set_attr) {
+        BOOL on = TRUE;
+        if (FAILED(set_attr(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &on, sizeof(on))))
+            set_attr(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE_OLD, &on, sizeof(on));
+    }
+    FreeLibrary(dwm);
+}
+
+static void fill_round(HDC dc, RECT rc, COLORREF fill, COLORREF border, int radius) {
+    HBRUSH br = CreateSolidBrush(fill);
+    HPEN   pn = CreatePen(PS_SOLID, 1, border);
+    HBRUSH ob = (HBRUSH)SelectObject(dc, br);
+    HPEN   op = (HPEN)SelectObject(dc, pn);
+    RoundRect(dc, rc.left, rc.top, rc.right, rc.bottom, radius, radius);
+    SelectObject(dc, ob);
+    SelectObject(dc, op);
+    DeleteObject(br);
+    DeleteObject(pn);
+}
+
+// --- Owner-drawn buttons: hover tracking via a tiny subclass ---------------
+static WNDPROC g_btn_oldproc = NULL;
+
+static LRESULT CALLBACK BtnSubProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    switch (m) {
+    case WM_MOUSEMOVE:
+        if (!GetWindowLongPtrA(h, GWLP_USERDATA)) {
+            TRACKMOUSEEVENT tme = { sizeof(tme), TME_LEAVE, h, 0 };
+            SetWindowLongPtrA(h, GWLP_USERDATA, 1);
+            TrackMouseEvent(&tme);
+            InvalidateRect(h, NULL, FALSE);
+        }
+        break;
+    case WM_MOUSELEAVE:
+        SetWindowLongPtrA(h, GWLP_USERDATA, 0);
+        InvalidateRect(h, NULL, FALSE);
+        break;
+    }
+    return CallWindowProcA(g_btn_oldproc, h, m, w, l);
+}
+
+static HWND make_button(HWND parent, const char *text, int id,
+                        int x, int y, int cx, int cy, int disabled) {
+    HWND b = CreateWindowA("BUTTON", text,
+        WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | (disabled ? WS_DISABLED : 0),
+        x, y, cx, cy, parent, (HMENU)(LONG_PTR)id, GetModuleHandle(NULL), NULL);
+    SendMessage(b, WM_SETFONT, (WPARAM)g_font_ui, TRUE);
+    WNDPROC prev = (WNDPROC)SetWindowLongPtrA(b, GWLP_WNDPROC, (LONG_PTR)BtnSubProc);
+    if (!g_btn_oldproc) g_btn_oldproc = prev;
+    return b;
+}
+
+// --- Owner-drawn ListView header -------------------------------------------
+static WNDPROC g_hdr_oldproc = NULL;
+
+static LRESULT CALLBACK HeaderSubProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    if (m == WM_ERASEBKGND) return 1;
+    if (m == WM_PAINT) {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(h, &ps);
+        RECT rc;
+        GetClientRect(h, &rc);
+        HBRUSH br = CreateSolidBrush(CLR_PANEL_ALT);
+        FillRect(dc, &rc, br);
+        DeleteObject(br);
+
+        HFONT of = (HFONT)SelectObject(dc, g_font_ui);
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, CLR_TEXT_DIM);
+
+        int n = (int)SendMessageA(h, HDM_GETITEMCOUNT, 0, 0);
+        for (int i = 0; i < n; i++) {
+            RECT ir;
+            if (!SendMessageA(h, HDM_GETITEMRECT, (WPARAM)i, (LPARAM)&ir)) continue;
+            char txt[64] = {0};
+            HDITEMA it = {0};
+            it.mask = HDI_TEXT;
+            it.pszText = txt;
+            it.cchTextMax = sizeof(txt) - 1;
+            SendMessageA(h, HDM_GETITEMA, (WPARAM)i, (LPARAM)&it);
+
+            RECT tr = ir;
+            tr.left += 10;
+            DrawTextA(dc, txt, -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+
+            HPEN pn = CreatePen(PS_SOLID, 1, CLR_BORDER);
+            HPEN op = (HPEN)SelectObject(dc, pn);
+            MoveToEx(dc, ir.right - 1, ir.top + 5, NULL);
+            LineTo(dc, ir.right - 1, ir.bottom - 5);
+            SelectObject(dc, op);
+            DeleteObject(pn);
+        }
+
+        // bottom separator
+        HPEN pn = CreatePen(PS_SOLID, 1, CLR_BORDER);
+        HPEN op = (HPEN)SelectObject(dc, pn);
+        MoveToEx(dc, rc.left, rc.bottom - 1, NULL);
+        LineTo(dc, rc.right, rc.bottom - 1);
+        SelectObject(dc, op);
+        DeleteObject(pn);
+
+        SelectObject(dc, of);
+        EndPaint(h, &ps);
+        return 0;
+    }
+    return CallWindowProcA(g_hdr_oldproc, h, m, w, l);
+}
+
+// ---------------------------------------------------------------------------
 // WinMain
 // ---------------------------------------------------------------------------
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow) {
@@ -106,6 +261,20 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow) {
 
     INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_LISTVIEW_CLASSES | ICC_PROGRESS_CLASS };
     InitCommonControlsEx(&icc);
+
+    g_br_bg        = CreateSolidBrush(CLR_BG);
+    g_br_panel     = CreateSolidBrush(CLR_PANEL);
+    g_br_panel_alt = CreateSolidBrush(CLR_PANEL_ALT);
+
+    g_font_ui = CreateFontA(-15, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                            CLEARTYPE_QUALITY, VARIABLE_PITCH | FF_SWISS, "Segoe UI");
+    g_font_bold = CreateFontA(-19, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+                            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                            CLEARTYPE_QUALITY, VARIABLE_PITCH | FF_SWISS, "Segoe UI");
+    g_font_mono = CreateFontA(-13, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                            CLEARTYPE_QUALITY, FIXED_PITCH | FF_MODERN, "Consolas");
 
     GetModuleFileNameA(NULL, g_cfg_path, MAX_PATH);
     char *last_slash = strrchr(g_cfg_path, '\\');
@@ -130,16 +299,17 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow) {
     wc.lpfnWndProc   = WndProc;
     wc.hInstance     = hInst;
     wc.lpszClassName = "SteamAutoUpdater";
-    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    wc.hbrBackground = g_br_bg;
     wc.hIcon         = LoadIcon(NULL, IDI_APPLICATION);
     wc.hCursor       = LoadCursor(NULL, IDC_ARROW);
     RegisterClassA(&wc);
 
-    g_hwnd = CreateWindowExA(0, "SteamAutoUpdater",
-                              "Steam Auto-Updater v2.0 (F2P)",
+    g_hwnd = CreateWindowExA(WS_EX_COMPOSITED, "SteamAutoUpdater",
+                              "Steam Auto-Updater v3.0 (F2P)",
                               WS_OVERLAPPEDWINDOW,
-                              CW_USEDEFAULT, CW_USEDEFAULT, 820, 620,
+                              CW_USEDEFAULT, CW_USEDEFAULT, 900, 680,
                               NULL, NULL, hInst, NULL);
+    enable_dark_titlebar(g_hwnd);
     ShowWindow(g_hwnd, nShow);
     UpdateWindow(g_hwnd);
 
@@ -162,65 +332,189 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_CREATE: {
         HINSTANCE hi = GetModuleHandle(NULL);
 
-        g_list = CreateWindowExA(WS_EX_CLIENTEDGE, WC_LISTVIEWA, "",
-            WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
-            8, 8, 560, 230, hwnd, (HMENU)ID_LIST_GAMES, hi, NULL);
+        g_title_txt = CreateWindowA("STATIC", "Steam Auto-Updater",
+            WS_CHILD | WS_VISIBLE | SS_LEFT,
+            16, 12, 400, 26, hwnd, (HMENU)ID_TITLE_TEXT, hi, NULL);
+        SendMessage(g_title_txt, WM_SETFONT, (WPARAM)g_font_bold, TRUE);
+
+        g_list = CreateWindowExA(0, WC_LISTVIEWA, "",
+            WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS
+            | LVS_NOSORTHEADER,
+            16, 46, 600, 260, hwnd, (HMENU)ID_LIST_GAMES, hi, NULL);
         ListView_SetExtendedListViewStyle(g_list,
-            LVS_EX_CHECKBOXES | LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
+            LVS_EX_CHECKBOXES | LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
+        SendMessage(g_list, WM_SETFONT, (WPARAM)g_font_ui, TRUE);
+        ListView_SetBkColor(g_list, CLR_PANEL);
+        ListView_SetTextBkColor(g_list, CLR_PANEL);
+        ListView_SetTextColor(g_list, CLR_TEXT);
+
+        HWND hdr = ListView_GetHeader(g_list);
+        if (hdr) {
+            SendMessage(hdr, WM_SETFONT, (WPARAM)g_font_ui, TRUE);
+            g_hdr_oldproc = (WNDPROC)SetWindowLongPtrA(hdr, GWLP_WNDPROC, (LONG_PTR)HeaderSubProc);
+        }
 
         LVCOLUMNA col = {0};
         col.mask = LVCF_TEXT | LVCF_WIDTH;
         col.cx = 70;  col.pszText = (LPSTR)"AppID";   ListView_InsertColumn(g_list, 0, &col);
-        col.cx = 210; col.pszText = (LPSTR)"Game";    ListView_InsertColumn(g_list, 1, &col);
-        col.cx = 80;  col.pszText = (LPSTR)"Size";    ListView_InsertColumn(g_list, 2, &col);
+        col.cx = 220; col.pszText = (LPSTR)"Game";    ListView_InsertColumn(g_list, 1, &col);
+        col.cx = 85;  col.pszText = (LPSTR)"Size";    ListView_InsertColumn(g_list, 2, &col);
         col.cx = 90;  col.pszText = (LPSTR)"BuildID"; ListView_InsertColumn(g_list, 3, &col);
-        col.cx = 150; col.pszText = (LPSTR)"Status";  ListView_InsertColumn(g_list, 4, &col);
+        col.cx = 200; col.pszText = (LPSTR)"Status";  ListView_InsertColumn(g_list, 4, &col);
 
-        g_btn_update = CreateWindowA("BUTTON", "Update selected",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-            578, 8, 210, 30, hwnd, (HMENU)ID_BTN_UPDATE, hi, NULL);
+        g_btn_update_all = make_button(hwnd, "Update ALL checked", ID_BTN_UPDATE_ALL, 630, 46,  240, 40, 0);
+        g_btn_update     = make_button(hwnd, "Update selected",    ID_BTN_UPDATE,     630, 94,  240, 34, 0);
+        g_btn_refresh    = make_button(hwnd, "Refresh list",       ID_BTN_REFRESH,    630, 136, 240, 34, 0);
+        g_btn_settings   = make_button(hwnd, "Settings",           ID_BTN_SETTINGS,   630, 178, 240, 34, 0);
+        g_btn_abort      = make_button(hwnd, "Abort",              ID_BTN_ABORT,      630, 220, 240, 34, 1);
 
-        g_btn_update_all = CreateWindowA("BUTTON", "Update ALL checked",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | BS_DEFPUSHBUTTON,
-            578, 46, 210, 34, hwnd, (HMENU)ID_BTN_UPDATE_ALL, hi, NULL);
-
-        g_btn_refresh = CreateWindowA("BUTTON", "Refresh list",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-            578, 88, 210, 30, hwnd, (HMENU)ID_BTN_REFRESH, hi, NULL);
-
-        CreateWindowA("BUTTON", "Settings",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-            578, 126, 210, 30, hwnd, (HMENU)ID_BTN_SETTINGS, hi, NULL);
-
-        g_btn_abort = CreateWindowA("BUTTON", "Abort",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_DISABLED,
-            578, 164, 210, 30, hwnd, (HMENU)ID_BTN_ABORT, hi, NULL);
-
-        g_progress = CreateWindowExA(0, PROGRESS_CLASSA, "",
-            WS_CHILD | WS_VISIBLE | PBS_SMOOTH,
-            8, 246, 780, 22, hwnd, (HMENU)ID_PROGRESS, hi, NULL);
-        SendMessage(g_progress, PBM_SETRANGE, 0, MAKELPARAM(0, 1000));
+        // Our own progress bar: a static we paint ourselves, so it can be dark
+        // and can show the percentage plus the current stage inside the bar.
+        g_progress = CreateWindowA("STATIC", "",
+            WS_CHILD | WS_VISIBLE | SS_OWNERDRAW,
+            16, 318, 854, 28, hwnd, (HMENU)ID_PROGRESS, hi, NULL);
 
         g_status_txt = CreateWindowA("STATIC", "Idle",
-            WS_CHILD | WS_VISIBLE | SS_LEFT,
-            8, 272, 780, 20, hwnd, (HMENU)ID_STATUS_TEXT, hi, NULL);
+            WS_CHILD | WS_VISIBLE | SS_LEFT | SS_ENDELLIPSIS,
+            16, 354, 854, 20, hwnd, (HMENU)ID_STATUS_TEXT, hi, NULL);
+        SendMessage(g_status_txt, WM_SETFONT, (WPARAM)g_font_ui, TRUE);
 
         g_queue_txt = CreateWindowA("STATIC", "Queue: empty",
-            WS_CHILD | WS_VISIBLE | SS_LEFT,
-            8, 294, 780, 20, hwnd, (HMENU)ID_QUEUE_TEXT, hi, NULL);
+            WS_CHILD | WS_VISIBLE | SS_LEFT | SS_ENDELLIPSIS,
+            16, 376, 854, 20, hwnd, (HMENU)ID_QUEUE_TEXT, hi, NULL);
+        SendMessage(g_queue_txt, WM_SETFONT, (WPARAM)g_font_ui, TRUE);
 
-        g_log_txt = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "",
+        g_log_txt = CreateWindowExA(0, "EDIT", "",
             WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
-            8, 318, 780, 240, hwnd, (HMENU)ID_LOG_TEXT, hi, NULL);
+            16, 402, 854, 230, hwnd, (HMENU)ID_LOG_TEXT, hi, NULL);
         SendMessage(g_log_txt, EM_SETLIMITTEXT, 65536, 0);
+        SendMessage(g_log_txt, WM_SETFONT, (WPARAM)g_font_mono, TRUE);
 
-        HFONT hfont = CreateFontA(14, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-                                   DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                                   DEFAULT_QUALITY, FIXED_PITCH | FF_MODERN, "Consolas");
-        SendMessage(g_log_txt, WM_SETFONT, (WPARAM)hfont, TRUE);
-
+        SetProgress(0.0, "idle", 0);
         RefreshGameList();
-        SetTimer(hwnd, ID_TIMER_REFRESH, 200, NULL);
+        SetTimer(hwnd, ID_TIMER_REFRESH, 100, NULL);
+        break;
+    }
+
+    // --- dark colours for the standard controls --------------------------
+    case WM_CTLCOLORSTATIC: {
+        HDC dc = (HDC)wp;
+        HWND ctl = (HWND)lp;
+        SetBkMode(dc, TRANSPARENT);
+        if (ctl == g_log_txt) {
+            SetTextColor(dc, CLR_TEXT_DIM);
+            SetBkColor(dc, CLR_PANEL);
+            return (LRESULT)g_br_panel;
+        }
+        if (ctl == g_title_txt)  SetTextColor(dc, CLR_TEXT);
+        else if (ctl == g_queue_txt) SetTextColor(dc, CLR_TEXT_DIM);
+        else                         SetTextColor(dc, CLR_TEXT);
+        SetBkColor(dc, CLR_BG);
+        return (LRESULT)g_br_bg;
+    }
+
+    case WM_CTLCOLOREDIT: {
+        HDC dc = (HDC)wp;
+        SetTextColor(dc, CLR_TEXT);
+        SetBkColor(dc, CLR_PANEL_ALT);
+        return (LRESULT)g_br_panel_alt;
+    }
+
+    // --- owner-drawn buttons + progress bar ------------------------------
+    case WM_DRAWITEM: {
+        DRAWITEMSTRUCT *di = (DRAWITEMSTRUCT *)lp;
+
+        if (di->CtlID == ID_PROGRESS) {
+            RECT rc = di->rcItem;
+            fill_round(di->hDC, rc, CLR_PANEL, CLR_BORDER, 8);
+
+            double p = g_pct;
+            if (p < 0.0)   p = 0.0;
+            if (p > 100.0) p = 100.0;
+            int w = (int)((rc.right - rc.left - 4) * (p / 100.0));
+            if (w > 2) {
+                RECT fr = { rc.left + 2, rc.top + 2, rc.left + 2 + w, rc.bottom - 2 };
+                COLORREF c = g_pct_failed ? CLR_FAIL
+                           : (p >= 100.0 ? CLR_OK : CLR_ACCENT);
+                fill_round(di->hDC, fr, c, c, 7);
+            }
+
+            SetBkMode(di->hDC, TRANSPARENT);
+            SetTextColor(di->hDC, CLR_TEXT);
+            HFONT of = (HFONT)SelectObject(di->hDC, g_font_ui);
+            DrawTextA(di->hDC, g_pct_label, -1, &rc,
+                      DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+            SelectObject(di->hDC, of);
+            return TRUE;
+        }
+
+        if (di->CtlType == ODT_BUTTON) {
+            int hovered  = (int)GetWindowLongPtrA(di->hwndItem, GWLP_USERDATA);
+            int pressed  = (di->itemState & ODS_SELECTED) ? 1 : 0;
+            int disabled = (di->itemState & ODS_DISABLED) ? 1 : 0;
+            int primary  = (di->CtlID == ID_BTN_UPDATE_ALL);
+
+            COLORREF fill, border, text;
+            if (disabled) {
+                fill = CLR_PANEL; border = CLR_BORDER; text = RGB(110, 110, 120);
+            } else if (primary) {
+                fill   = pressed ? CLR_ACCENT_DOWN : (hovered ? CLR_ACCENT_HOVER : CLR_ACCENT);
+                border = fill;
+                text   = RGB(255, 255, 255);
+            } else {
+                fill   = pressed ? CLR_BG : (hovered ? CLR_PANEL_ALT : CLR_PANEL);
+                border = hovered ? CLR_ACCENT : CLR_BORDER;
+                text   = CLR_TEXT;
+            }
+            if (di->CtlID == ID_BTN_ABORT && !disabled) {
+                fill   = pressed ? RGB(170, 60, 60) : (hovered ? RGB(214, 78, 78) : CLR_PANEL);
+                border = hovered || pressed ? RGB(214, 78, 78) : CLR_BORDER;
+                text   = hovered || pressed ? RGB(255, 255, 255) : CLR_FAIL;
+            }
+
+            fill_round(di->hDC, di->rcItem, fill, border, 8);
+
+            char txt[128] = {0};
+            GetWindowTextA(di->hwndItem, txt, sizeof(txt) - 1);
+            SetBkMode(di->hDC, TRANSPARENT);
+            SetTextColor(di->hDC, text);
+            HFONT of = (HFONT)SelectObject(di->hDC, g_font_ui);
+            DrawTextA(di->hDC, txt, -1, &di->rcItem,
+                      DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            SelectObject(di->hDC, of);
+            return TRUE;
+        }
+        break;
+    }
+
+    // --- colour the Status column per row --------------------------------
+    case WM_NOTIFY: {
+        NMHDR *nh = (NMHDR *)lp;
+        if (nh->idFrom == ID_LIST_GAMES && nh->code == NM_CUSTOMDRAW) {
+            NMLVCUSTOMDRAW *cd = (NMLVCUSTOMDRAW *)lp;
+            switch (cd->nmcd.dwDrawStage) {
+            case CDDS_PREPAINT:
+                return CDRF_NOTIFYITEMDRAW;
+            case CDDS_ITEMPREPAINT:
+                return CDRF_NOTIFYSUBITEMDRAW;
+            case CDDS_ITEMPREPAINT | CDDS_SUBITEM: {
+                int row = (int)cd->nmcd.dwItemSpec;
+                cd->clrTextBk = (row % 2) ? CLR_PANEL_ALT : CLR_PANEL;
+                if (cd->iSubItem == 4 && row >= 0 && row < g_row_count) {
+                    switch (g_rows[row].result) {
+                    case 1:  cd->clrText = CLR_OK;   break;
+                    case 2:  cd->clrText = CLR_FAIL; break;
+                    case 3:  cd->clrText = CLR_WARN; break;
+                    default: cd->clrText = g_rows[row].installed ? CLR_TEXT : CLR_TEXT_DIM;
+                    }
+                } else {
+                    cd->clrText = (row >= 0 && row < g_row_count && !g_rows[row].installed)
+                                  ? CLR_TEXT_DIM : CLR_TEXT;
+                }
+                return CDRF_NEWFONT;
+            }
+            }
+        }
         break;
     }
 
@@ -288,16 +582,30 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_SIZE: {
         int w = LOWORD(lp), h = HIWORD(lp);
         if (w > 0 && h > 0) {
-            MoveWindow(g_list,           8,     8, w-240, 230, TRUE);
-            MoveWindow(g_btn_update,     w-225, 8,   210, 30, TRUE);
-            MoveWindow(g_btn_update_all, w-225, 46,  210, 34, TRUE);
-            MoveWindow(g_btn_refresh,    w-225, 88,  210, 30, TRUE);
-            MoveWindow(g_btn_abort,      w-225, 164, 210, 30, TRUE);
-            MoveWindow(g_progress,   8, 246, w-16, 22, TRUE);
-            MoveWindow(g_status_txt, 8, 272, w-16, 20, TRUE);
-            MoveWindow(g_queue_txt,  8, 294, w-16, 20, TRUE);
-            MoveWindow(g_log_txt,    8, 318, w-16, h-326, TRUE);
+            int right_w = 240, gap = 14;
+            int list_w  = w - right_w - gap - 32;
+            if (list_w < 200) list_w = 200;
+            int bx = 16 + list_w + gap;
+
+            MoveWindow(g_title_txt,      16, 12, list_w, 26, TRUE);
+            MoveWindow(g_list,           16, 46, list_w, 260, TRUE);
+            MoveWindow(g_btn_update_all, bx, 46,  right_w, 40, TRUE);
+            MoveWindow(g_btn_update,     bx, 94,  right_w, 34, TRUE);
+            MoveWindow(g_btn_refresh,    bx, 136, right_w, 34, TRUE);
+            MoveWindow(g_btn_settings,   bx, 178, right_w, 34, TRUE);
+            MoveWindow(g_btn_abort,      bx, 220, right_w, 34, TRUE);
+            MoveWindow(g_progress,   16, 318, w-32, 28, TRUE);
+            MoveWindow(g_status_txt, 16, 354, w-32, 20, TRUE);
+            MoveWindow(g_queue_txt,  16, 376, w-32, 20, TRUE);
+            MoveWindow(g_log_txt,    16, 402, w-32, h-418, TRUE);
         }
+        break;
+    }
+
+    case WM_GETMINMAXINFO: {
+        MINMAXINFO *mmi = (MINMAXINFO *)lp;
+        mmi->ptMinTrackSize.x = 780;
+        mmi->ptMinTrackSize.y = 560;
         break;
     }
 
@@ -313,6 +621,19 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         break;
     }
     return DefWindowProcA(hwnd, msg, wp, lp);
+}
+
+// ---------------------------------------------------------------------------
+// Progress helper
+// ---------------------------------------------------------------------------
+static void SetProgress(double pct, const char *label, int failed) {
+    g_pct        = pct;
+    g_pct_failed = failed;
+    if (label && label[0])
+        snprintf(g_pct_label, sizeof(g_pct_label), "%.1f%%  -  %s", pct, label);
+    else
+        snprintf(g_pct_label, sizeof(g_pct_label), "%.1f%%", pct);
+    if (g_progress) InvalidateRect(g_progress, NULL, FALSE);
 }
 
 // ---------------------------------------------------------------------------
@@ -342,7 +663,13 @@ static void RefreshGameList(void) {
             strncpy(r->buildid, installed[j].buildid, sizeof(r->buildid)-1);
             double gb = atof(installed[j].size_on_disk) / (1024.0*1024.0*1024.0);
             snprintf(r->size, sizeof(r->size), "%.2f GB", gb);
-            strncpy(r->status, "Installed", sizeof(r->status)-1);
+            // Show which disk it sits on: games on C: are updated in place,
+            // fresh installs never land there.
+            if (installed[j].library_root[0] && installed[j].library_root[1] == ':')
+                snprintf(r->status, sizeof(r->status), "Installed (%c:)",
+                         installed[j].library_root[0]);
+            else
+                strncpy(r->status, "Installed", sizeof(r->status)-1);
             break;
         }
     }
@@ -361,6 +688,7 @@ static void RefreshGameList(void) {
         strncpy(r->status, "Installed (paid)", sizeof(r->status)-1);
     }
 
+    SendMessage(g_list, WM_SETREDRAW, FALSE, 0);
     ListView_DeleteAllItems(g_list);
     for (int i = 0; i < g_row_count; i++) {
         LVITEMA item = {0};
@@ -376,6 +704,8 @@ static void RefreshGameList(void) {
         // can be ticked manually to install them from scratch.
         ListView_SetCheckState(g_list, i, g_rows[i].installed ? TRUE : FALSE);
     }
+    SendMessage(g_list, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(g_list, NULL, TRUE);
 
     char buf[128];
     snprintf(buf, sizeof(buf), "List refreshed: %d rows (%d installed on this PC).",
@@ -429,9 +759,11 @@ static int StartRow(int row_idx) {
 
     strncpy(g_rows[row_idx].status, g_rows[row_idx].installed ? "Updating..." : "Installing...",
             sizeof(g_rows[row_idx].status)-1);
+    g_rows[row_idx].result = 3;
     ListView_SetItemText(g_list, row_idx, 4, g_rows[row_idx].status);
 
     g_current_row = row_idx;
+    SetProgress(0.0, g_rows[row_idx].installed ? "starting update" : "starting install", 0);
     g_worker = worker_start(&cfg, &g_wstatus);
     return g_worker != NULL;
 }
@@ -459,7 +791,7 @@ static void StartQueue(void) {
 }
 
 // ---------------------------------------------------------------------------
-// UpdateUIFromWorker (called every 200ms from the timer)
+// UpdateUIFromWorker (called every 100ms from the timer)
 // ---------------------------------------------------------------------------
 static void UpdateUIFromWorker(void) {
     EnterCriticalSection(&g_wstatus.lock);
@@ -477,16 +809,12 @@ static void UpdateUIFromWorker(void) {
     strncpy(errmsg,  g_wstatus.error_msg,    255);  errmsg[255] = '\0';
     LeaveCriticalSection(&g_wstatus.lock);
 
-    SendMessage(g_progress, PBM_SETPOS, (WPARAM)(pct * 10.0), 0);
+    SetProgress(pct, desc[0] ? desc : state_name(state), 0);
 
     char status_buf[320];
     const char *game = (g_current_row >= 0 && g_current_row < g_row_count)
                      ? g_rows[g_current_row].name : "";
-    if (desc[0])
-        snprintf(status_buf, sizeof(status_buf), "%s - %s %.1f%% (%s)",
-                 game, state_name(state), pct, desc);
-    else
-        snprintf(status_buf, sizeof(status_buf), "%s - %s", game, state_name(state));
+    snprintf(status_buf, sizeof(status_buf), "%s  -  %s", game, state_name(state));
     SetWindowTextA(g_status_txt, status_buf);
 
     static char last_log[512] = {0};
@@ -506,11 +834,15 @@ static void UpdateUIFromWorker(void) {
             g_ok_count++;
             strncpy(g_rows[g_current_row].status, "OK", sizeof(g_rows[g_current_row].status)-1);
             g_rows[g_current_row].installed = 1;
+            g_rows[g_current_row].result    = 1;
+            SetProgress(100.0, "complete", 0);
             AppendLog(">>> Done.");
         } else {
             g_fail_count++;
             snprintf(g_rows[g_current_row].status, sizeof(g_rows[g_current_row].status),
                      "FAILED: %s", errmsg[0] ? errmsg : "unknown");
+            g_rows[g_current_row].result = 2;
+            SetProgress(100.0, errmsg[0] ? errmsg : "failed", 1);
             char fail_msg[512];
             snprintf(fail_msg, sizeof(fail_msg), ">>> Failed: %s",
                      errmsg[0] ? errmsg : "Unknown error");
@@ -540,6 +872,7 @@ static void UpdateUIFromWorker(void) {
     snprintf(summary, sizeof(summary),
              "Finished. Success: %d, failed: %d.", g_ok_count, g_fail_count);
     SetWindowTextA(g_status_txt, summary);
+    SetProgress(100.0, summary, g_fail_count ? 1 : 0);
     AppendLog(summary);
     MessageBoxA(g_hwnd, summary, "Update finished",
                 MB_OK | (g_fail_count ? MB_ICONWARNING : MB_ICONINFORMATION));
@@ -579,43 +912,62 @@ static void AppendLog(const char *line) {
 #define ID_BTN_SAVE    205
 #define ID_BTN_BROWSE  206
 
+static HWND make_label(HWND parent, const char *text, int x, int y, int cx) {
+    HWND h = CreateWindowA("STATIC", text, WS_CHILD | WS_VISIBLE,
+                           x, y, cx, 20, parent, NULL, GetModuleHandle(NULL), NULL);
+    SendMessage(h, WM_SETFONT, (WPARAM)g_font_ui, TRUE);
+    return h;
+}
+
+static HWND make_edit(HWND parent, const char *text, int id, int x, int y, int cx, DWORD extra) {
+    HWND h = CreateWindowExA(0, "EDIT", text,
+                             WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | extra,
+                             x, y, cx, 24, parent, (HMENU)(LONG_PTR)id,
+                             GetModuleHandle(NULL), NULL);
+    SendMessage(h, WM_SETFONT, (WPARAM)g_font_ui, TRUE);
+    return h;
+}
+
 LRESULT CALLBACK SettingsDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_CREATE: {
         Config *cfg = (Config *)((CREATESTRUCTA*)lp)->lpCreateParams;
+        enable_dark_titlebar(hwnd);
 
-        CreateWindowA("STATIC", "Server URL:",
-            WS_CHILD|WS_VISIBLE, 10, 10, 100, 20, hwnd, NULL, NULL, NULL);
-        CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", cfg->server_url,
-            WS_CHILD|WS_VISIBLE|ES_AUTOHSCROLL,
-            10, 32, 380, 22, hwnd, (HMENU)ID_EDIT_URL, NULL, NULL);
+        make_label(hwnd, "Server URL:", 14, 12, 120);
+        make_edit(hwnd, cfg->server_url, ID_EDIT_URL, 14, 34, 380, 0);
 
-        CreateWindowA("STATIC", "API Key:",
-            WS_CHILD|WS_VISIBLE, 10, 62, 100, 20, hwnd, NULL, NULL, NULL);
-        CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", cfg->api_key,
-            WS_CHILD|WS_VISIBLE|ES_AUTOHSCROLL|ES_PASSWORD,
-            10, 84, 380, 22, hwnd, (HMENU)ID_EDIT_KEY, NULL, NULL);
+        make_label(hwnd, "API Key:", 14, 66, 120);
+        make_edit(hwnd, cfg->api_key, ID_EDIT_KEY, 14, 88, 380, ES_PASSWORD);
 
-        CreateWindowA("STATIC", "steamcmd.exe path:",
-            WS_CHILD|WS_VISIBLE, 10, 114, 150, 20, hwnd, NULL, NULL, NULL);
-        CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", cfg->steamcmd_path,
-            WS_CHILD|WS_VISIBLE|ES_AUTOHSCROLL,
-            10, 136, 300, 22, hwnd, (HMENU)ID_EDIT_CMD, NULL, NULL);
-        CreateWindowA("BUTTON", "...",
-            WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON,
-            318, 136, 72, 22, hwnd, (HMENU)ID_BTN_BROWSE, NULL, NULL);
+        make_label(hwnd, "steamcmd.exe path:", 14, 120, 180);
+        make_edit(hwnd, cfg->steamcmd_path, ID_EDIT_CMD, 14, 142, 300, 0);
+        make_button(hwnd, "...", ID_BTN_BROWSE, 322, 142, 72, 24, 0);
 
-        CreateWindowA("STATIC", "PC ID:",
-            WS_CHILD|WS_VISIBLE, 10, 166, 100, 20, hwnd, NULL, NULL, NULL);
-        CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", cfg->pc_id,
-            WS_CHILD|WS_VISIBLE|ES_AUTOHSCROLL,
-            10, 188, 200, 22, hwnd, (HMENU)ID_EDIT_PCID, NULL, NULL);
+        make_label(hwnd, "PC ID:", 14, 174, 120);
+        make_edit(hwnd, cfg->pc_id, ID_EDIT_PCID, 14, 196, 200, 0);
 
-        CreateWindowA("BUTTON", "Save",
-            WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON|BS_DEFPUSHBUTTON,
-            310, 218, 80, 28, hwnd, (HMENU)ID_BTN_SAVE, NULL, NULL);
+        make_button(hwnd, "Save", ID_BTN_SAVE, 304, 232, 90, 30, 0);
         break;
     }
+
+    case WM_CTLCOLORSTATIC: {
+        HDC dc = (HDC)wp;
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, CLR_TEXT_DIM);
+        SetBkColor(dc, CLR_BG);
+        return (LRESULT)g_br_bg;
+    }
+
+    case WM_CTLCOLOREDIT: {
+        HDC dc = (HDC)wp;
+        SetTextColor(dc, CLR_TEXT);
+        SetBkColor(dc, CLR_PANEL_ALT);
+        return (LRESULT)g_br_panel_alt;
+    }
+
+    case WM_DRAWITEM:
+        return SendMessage(g_hwnd, WM_DRAWITEM, wp, lp);
 
     case WM_COMMAND: {
         if (LOWORD(wp) == ID_BTN_SAVE) {
@@ -651,15 +1003,20 @@ LRESULT CALLBACK SettingsDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 static void ShowSettingsDialog(HWND parent) {
-    WNDCLASSA wc = {0};
-    wc.lpfnWndProc   = SettingsDlgProc;
-    wc.hInstance     = GetModuleHandle(NULL);
-    wc.lpszClassName = "SettingsDlg";
-    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
-    RegisterClassA(&wc);
+    static int registered = 0;
+    if (!registered) {
+        WNDCLASSA wc = {0};
+        wc.lpfnWndProc   = SettingsDlgProc;
+        wc.hInstance     = GetModuleHandle(NULL);
+        wc.lpszClassName = "SettingsDlg";
+        wc.hbrBackground = g_br_bg;
+        wc.hCursor       = LoadCursor(NULL, IDC_ARROW);
+        RegisterClassA(&wc);
+        registered = 1;
+    }
 
     CreateWindowExA(WS_EX_DLGMODALFRAME, "SettingsDlg", "Settings",
                     WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
-                    CW_USEDEFAULT, CW_USEDEFAULT, 410, 280,
+                    CW_USEDEFAULT, CW_USEDEFAULT, 425, 300,
                     parent, NULL, GetModuleHandle(NULL), &g_cfg);
 }
