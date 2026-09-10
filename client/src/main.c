@@ -1,6 +1,7 @@
 // main.c - Steam Auto-Updater client, Win32 GUI entry point
 // Native Win32 UI: no external frameworks, single .exe
-// v3: dark theme, owner-drawn controls, sequential queue
+// v4: Steam-like progress (bytes/speed/ETA/stall), single instance,
+//     sleep + shutdown guards, persistent file log, extra safety handlers
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <commctrl.h>
@@ -8,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include "config.h"
 #include "acf.h"
 #include "worker.h"
@@ -31,9 +33,14 @@
 #define ID_BTN_REFRESH     109
 #define ID_QUEUE_TEXT      110
 #define ID_TITLE_TEXT      111
+#define ID_BTN_CHECK_ALL   112
 #define ID_TIMER_REFRESH   1001
 
 #define MAX_ROWS 128
+
+// A download that reports no new bytes for this long is almost certainly wedged
+// (dead LAN link, Steam CDN hiccup, antivirus holding the file).
+#define STALL_WARN_MS   120000
 
 // ---------------------------------------------------------------------------
 // Dark palette
@@ -85,6 +92,7 @@ static HWND          g_btn_update_all = NULL;
 static HWND          g_btn_refresh    = NULL;
 static HWND          g_btn_settings   = NULL;
 static HWND          g_btn_abort      = NULL;
+static HWND          g_btn_check_all  = NULL;
 static HWND          g_progress       = NULL;
 static HWND          g_status_txt     = NULL;
 static HWND          g_queue_txt      = NULL;
@@ -92,10 +100,12 @@ static HWND          g_log_txt        = NULL;
 
 static Config        g_cfg                 = {0};
 static char          g_cfg_path[MAX_PATH]  = {0};
+static char          g_logfile[MAX_PATH]   = {0};
 static GameRow       g_rows[MAX_ROWS]      = {0};
 static int           g_row_count           = 0;
 
 static HANDLE        g_worker      = NULL;
+static HANDLE        g_single_inst = NULL;
 static WorkerStatus  g_wstatus     = {0};
 
 // Sequential queue of row indices
@@ -105,11 +115,23 @@ static int           g_queue_pos       = 0;
 static int           g_current_row     = -1;
 static int           g_ok_count        = 0;
 static int           g_fail_count      = 0;
+static int           g_aborting        = 0;
 
-// Progress bar state (drawn by us)
-static double        g_pct             = 0.0;
-static char          g_pct_label[128]  = {0};
+// --- Progress engine state (Steam-like) ------------------------------------
+static double        g_pct             = 0.0;   // what we actually draw
+static char          g_pct_label[192]  = {0};
 static int           g_pct_failed      = 0;
+static int           g_pct_warn        = 0;
+
+static unsigned long long g_bytes_done  = 0;
+static unsigned long long g_bytes_total = 0;
+static double        g_speed_bps       = 0.0;   // smoothed bytes/sec
+static ULONGLONG     g_tick_bytes      = 0;     // last time bytes changed
+static ULONGLONG     g_tick_sample     = 0;     // last speed sample
+static unsigned long long g_bytes_sample = 0;
+static ULONGLONG     g_tick_job_start  = 0;
+static char          g_stage[32]       = {0};
+static double        g_stage_floor     = 0.0;   // monotonic guard
 
 // ---------------------------------------------------------------------------
 // Forward declarations
@@ -122,7 +144,10 @@ static void      UpdateUIFromWorker(void);
 static void      ShowSettingsDialog(HWND parent);
 static void      AppendLog(const char *line);
 static void      SetQueueText(void);
-static void      SetProgress(double pct, const char *label, int failed);
+static void      DrawProgress(double pct, const char *label, int failed, int warn);
+static void      ProgressReset(void);
+static void      ProgressUpdate(WorkerState state, double raw_pct,
+                                const char *desc, const char *logline);
 
 static const char *state_name(WorkerState s) {
     switch (s) {
@@ -135,6 +160,25 @@ static const char *state_name(WorkerState s) {
         case WORKER_DONE_FAIL:     return "Failed";
         default:                   return "Unknown";
     }
+}
+
+// ---------------------------------------------------------------------------
+// Small formatting helpers
+// ---------------------------------------------------------------------------
+static void fmt_bytes(unsigned long long b, char *out, size_t n) {
+    double v = (double)b;
+    if (v >= 1024.0*1024.0*1024.0) snprintf(out, n, "%.2f GB", v/(1024.0*1024.0*1024.0));
+    else if (v >= 1024.0*1024.0)   snprintf(out, n, "%.0f MB", v/(1024.0*1024.0));
+    else if (v >= 1024.0)          snprintf(out, n, "%.0f KB", v/1024.0);
+    else                           snprintf(out, n, "%llu B", b);
+}
+
+static void fmt_secs(double s, char *out, size_t n) {
+    if (s < 0 || s > 86400.0*7) { snprintf(out, n, "--"); return; }
+    int t = (int)(s + 0.5);
+    if (t < 60)        snprintf(out, n, "%d sec", t);
+    else if (t < 3600) snprintf(out, n, "%d min %02d sec", t/60, t%60);
+    else               snprintf(out, n, "%d h %02d min", t/3600, (t%3600)/60);
 }
 
 // ---------------------------------------------------------------------------
@@ -254,10 +298,36 @@ static LRESULT CALLBACK HeaderSubProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 }
 
 // ---------------------------------------------------------------------------
+// Keep the machine awake while a queue is running.
+// A 40 GB install on a club PC with a 15-minute sleep timer used to die
+// halfway through and leave the account leased.
+// ---------------------------------------------------------------------------
+static void keep_awake(int on) {
+    if (on) SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_AWAYMODE_REQUIRED);
+    else    SetThreadExecutionState(ES_CONTINUOUS);
+}
+
+// ---------------------------------------------------------------------------
 // WinMain
 // ---------------------------------------------------------------------------
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow) {
     (void)hPrev; (void)lpCmd;
+
+    // --- single instance ---------------------------------------------------
+    // Two copies at once would fight over the same lease.json and could kill
+    // each other's steamcmd. Focus the running window instead.
+    g_single_inst = CreateMutexA(NULL, TRUE, "Global\\SteamAutoUpdater_SingleInstance");
+    if (g_single_inst && GetLastError() == ERROR_ALREADY_EXISTS) {
+        HWND prev_win = FindWindowA("SteamAutoUpdater", NULL);
+        if (prev_win) {
+            ShowWindow(prev_win, SW_RESTORE);
+            SetForegroundWindow(prev_win);
+        } else {
+            MessageBoxA(NULL, "Steam Auto-Updater is already running.",
+                        "Already running", MB_OK | MB_ICONINFORMATION);
+        }
+        return 0;
+    }
 
     INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_LISTVIEW_CLASSES | ICC_PROGRESS_CLASS };
     InitCommonControlsEx(&icc);
@@ -276,9 +346,12 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow) {
                             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                             CLEARTYPE_QUALITY, FIXED_PITCH | FF_MODERN, "Consolas");
 
+    // config + log file live next to the exe
     GetModuleFileNameA(NULL, g_cfg_path, MAX_PATH);
     char *last_slash = strrchr(g_cfg_path, '\\');
     if (last_slash) *(last_slash + 1) = '\0';
+    strncpy(g_logfile, g_cfg_path, MAX_PATH - 1);
+    strncat(g_logfile,  "updater.log", MAX_PATH - strlen(g_logfile) - 1);
     strncat(g_cfg_path, "updater.ini", MAX_PATH - strlen(g_cfg_path) - 1);
     int cfg_ok = config_load(g_cfg_path, &g_cfg);
 
@@ -305,9 +378,9 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow) {
     RegisterClassA(&wc);
 
     g_hwnd = CreateWindowExA(WS_EX_COMPOSITED, "SteamAutoUpdater",
-                              "Steam Auto-Updater v3.0 (F2P)",
+                              "Steam Auto-Updater v4.0 (F2P)",
                               WS_OVERLAPPEDWINDOW,
-                              CW_USEDEFAULT, CW_USEDEFAULT, 900, 680,
+                              CW_USEDEFAULT, CW_USEDEFAULT, 920, 700,
                               NULL, NULL, hInst, NULL);
     enable_dark_titlebar(g_hwnd);
     ShowWindow(g_hwnd, nShow);
@@ -319,7 +392,9 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow) {
         DispatchMessage(&msg);
     }
 
+    keep_awake(0);
     DeleteCriticalSection(&g_wstatus.lock);
+    if (g_single_inst) { ReleaseMutex(g_single_inst); CloseHandle(g_single_inst); }
     return (int)msg.wParam;
 }
 
@@ -364,34 +439,49 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
         g_btn_update_all = make_button(hwnd, "Update ALL checked", ID_BTN_UPDATE_ALL, 630, 46,  240, 40, 0);
         g_btn_update     = make_button(hwnd, "Update selected",    ID_BTN_UPDATE,     630, 94,  240, 34, 0);
-        g_btn_refresh    = make_button(hwnd, "Refresh list",       ID_BTN_REFRESH,    630, 136, 240, 34, 0);
-        g_btn_settings   = make_button(hwnd, "Settings",           ID_BTN_SETTINGS,   630, 178, 240, 34, 0);
-        g_btn_abort      = make_button(hwnd, "Abort",              ID_BTN_ABORT,      630, 220, 240, 34, 1);
+        g_btn_check_all  = make_button(hwnd, "Check / uncheck all",ID_BTN_CHECK_ALL,  630, 136, 240, 34, 0);
+        g_btn_refresh    = make_button(hwnd, "Refresh list",       ID_BTN_REFRESH,    630, 178, 240, 34, 0);
+        g_btn_settings   = make_button(hwnd, "Settings",           ID_BTN_SETTINGS,   630, 220, 240, 34, 0);
+        g_btn_abort      = make_button(hwnd, "Abort",              ID_BTN_ABORT,      630, 262, 240, 34, 1);
 
         // Our own progress bar: a static we paint ourselves, so it can be dark
-        // and can show the percentage plus the current stage inside the bar.
+        // and can show percentage, stage, bytes, speed and ETA inside the bar.
         g_progress = CreateWindowA("STATIC", "",
             WS_CHILD | WS_VISIBLE | SS_OWNERDRAW,
-            16, 318, 854, 28, hwnd, (HMENU)ID_PROGRESS, hi, NULL);
+            16, 318, 854, 30, hwnd, (HMENU)ID_PROGRESS, hi, NULL);
 
         g_status_txt = CreateWindowA("STATIC", "Idle",
             WS_CHILD | WS_VISIBLE | SS_LEFT | SS_ENDELLIPSIS,
-            16, 354, 854, 20, hwnd, (HMENU)ID_STATUS_TEXT, hi, NULL);
+            16, 356, 854, 20, hwnd, (HMENU)ID_STATUS_TEXT, hi, NULL);
         SendMessage(g_status_txt, WM_SETFONT, (WPARAM)g_font_ui, TRUE);
 
         g_queue_txt = CreateWindowA("STATIC", "Queue: empty",
             WS_CHILD | WS_VISIBLE | SS_LEFT | SS_ENDELLIPSIS,
-            16, 376, 854, 20, hwnd, (HMENU)ID_QUEUE_TEXT, hi, NULL);
+            16, 378, 854, 20, hwnd, (HMENU)ID_QUEUE_TEXT, hi, NULL);
         SendMessage(g_queue_txt, WM_SETFONT, (WPARAM)g_font_ui, TRUE);
 
         g_log_txt = CreateWindowExA(0, "EDIT", "",
             WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
-            16, 402, 854, 230, hwnd, (HMENU)ID_LOG_TEXT, hi, NULL);
-        SendMessage(g_log_txt, EM_SETLIMITTEXT, 65536, 0);
+            16, 404, 854, 230, hwnd, (HMENU)ID_LOG_TEXT, hi, NULL);
+        SendMessage(g_log_txt, EM_SETLIMITTEXT, 262144, 0);
         SendMessage(g_log_txt, WM_SETFONT, (WPARAM)g_font_mono, TRUE);
 
-        SetProgress(0.0, "idle", 0);
+        ProgressReset();
+        DrawProgress(0.0, "idle", 0, 0);
         RefreshGameList();
+
+        // One-time config sanity warnings, printed instead of silently failing later
+        if (!g_cfg.server_url[0] || !g_cfg.api_key[0])
+            AppendLog("WARNING: server URL / API key not set. Open Settings first.");
+        else if (_strnicmp(g_cfg.server_url, "http://", 7) == 0)
+            AppendLog("WARNING: server_url uses plain http:// - Steam passwords travel unencrypted "
+                      "over the club LAN. Switch the server to https.");
+        if (g_cfg.steamcmd_path[0] &&
+            GetFileAttributesA(g_cfg.steamcmd_path) == INVALID_FILE_ATTRIBUTES)
+            AppendLog("WARNING: steamcmd.exe not found at the configured path.");
+        if (!g_cfg.pc_id[0])
+            AppendLog("WARNING: pc_id is empty. The server log will not show which PC this is.");
+
         SetTimer(hwnd, ID_TIMER_REFRESH, 100, NULL);
         break;
     }
@@ -431,11 +521,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             double p = g_pct;
             if (p < 0.0)   p = 0.0;
             if (p > 100.0) p = 100.0;
-            int w = (int)((rc.right - rc.left - 4) * (p / 100.0));
+            int track = rc.right - rc.left - 4;
+            int w = (int)(track * (p / 100.0));
             if (w > 2) {
                 RECT fr = { rc.left + 2, rc.top + 2, rc.left + 2 + w, rc.bottom - 2 };
                 COLORREF c = g_pct_failed ? CLR_FAIL
-                           : (p >= 100.0 ? CLR_OK : CLR_ACCENT);
+                           : g_pct_warn   ? CLR_WARN
+                           : (p >= 99.999 ? CLR_OK : CLR_ACCENT);
                 fill_round(di->hDC, fr, c, c, 7);
             }
 
@@ -487,9 +579,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         break;
     }
 
-    // --- colour the Status column per row --------------------------------
+    // --- list view: custom colours + double-click to update one game -----
     case WM_NOTIFY: {
         NMHDR *nh = (NMHDR *)lp;
+
+        if (nh->idFrom == ID_LIST_GAMES && nh->code == NM_DBLCLK) {
+            if (!g_worker) SendMessage(hwnd, WM_COMMAND, ID_BTN_UPDATE, 0);
+            return 0;
+        }
+
         if (nh->idFrom == ID_LIST_GAMES && nh->code == NM_CUSTOMDRAW) {
             NMLVCUSTOMDRAW *cd = (NMLVCUSTOMDRAW *)lp;
             switch (cd->nmcd.dwDrawStage) {
@@ -528,7 +626,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         int ctrl_id = LOWORD(wp);
 
         if (ctrl_id == ID_BTN_UPDATE || ctrl_id == ID_BTN_UPDATE_ALL) {
-            if (GetFileAttributesA(g_cfg.steamcmd_path) == INVALID_FILE_ATTRIBUTES) {
+            if (!g_cfg.steamcmd_path[0] ||
+                GetFileAttributesA(g_cfg.steamcmd_path) == INVALID_FILE_ATTRIBUTES) {
                 MessageBoxA(hwnd, "steamcmd.exe not found. Check Settings.",
                             "Configuration Error", MB_OK | MB_ICONERROR);
                 return 0;
@@ -543,6 +642,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_queue_pos = 0;
             g_ok_count  = 0;
             g_fail_count = 0;
+            g_aborting   = 0;
 
             if (ctrl_id == ID_BTN_UPDATE) {
                 int sel = ListView_GetNextItem(g_list, -1, LVNI_SELECTED);
@@ -561,14 +661,43 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                 "Empty queue", MB_OK | MB_ICONINFORMATION);
                     return 0;
                 }
+                // Warn about mass fresh installs: that is tens of GB per PC.
+                int fresh = 0;
+                for (int i = 0; i < g_queue_len; i++)
+                    if (!g_rows[g_queue[i]].installed) fresh++;
+                if (fresh >= 3) {
+                    char q[320];
+                    snprintf(q, sizeof(q),
+                        "%d of the %d checked games are NOT installed yet.\n"
+                        "That means full downloads (tens of GB) on this PC.\n\nContinue?",
+                        fresh, g_queue_len);
+                    if (MessageBoxA(hwnd, q, "Confirm fresh installs",
+                                    MB_YESNO | MB_ICONQUESTION) != IDYES)
+                        return 0;
+                }
             }
             StartQueue();
         }
+        else if (ctrl_id == ID_BTN_CHECK_ALL) {
+            int any_unchecked = 0;
+            for (int i = 0; i < g_row_count; i++)
+                if (!ListView_GetCheckState(g_list, i)) { any_unchecked = 1; break; }
+            for (int i = 0; i < g_row_count; i++)
+                ListView_SetCheckState(g_list, i, any_unchecked ? TRUE : FALSE);
+        }
         else if (ctrl_id == ID_BTN_ABORT) {
+            if (MessageBoxA(hwnd,
+                    "Stop after the current game?\n\n"
+                    "The running steamcmd will be terminated and the account released. "
+                    "A partially downloaded game stays partial and resumes next time.",
+                    "Abort", MB_YESNO | MB_ICONQUESTION) != IDYES)
+                return 0;
+            g_aborting = 1;
             worker_request_abort();
             g_queue_len = g_queue_pos;   // stop after the current game
             EnableWindow(g_btn_abort, FALSE);
             SetWindowTextA(g_status_txt, "Aborting...");
+            AppendLog(">>> Abort requested by the operator.");
         }
         else if (ctrl_id == ID_BTN_SETTINGS) {
             ShowSettingsDialog(hwnd);
@@ -578,6 +707,18 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         break;
     }
+
+    // --- do not let Windows sleep / reboot in the middle of an update ----
+    case WM_QUERYENDSESSION:
+        if (g_worker) {
+            AppendLog("WARNING: shutdown/logoff requested while updating - blocked.");
+            return FALSE;
+        }
+        return TRUE;
+
+    case WM_POWERBROADCAST:
+        if (wp == PBT_APMQUERYSUSPEND && g_worker) return BROADCAST_QUERY_DENY;
+        break;
 
     case WM_SIZE: {
         int w = LOWORD(lp), h = HIWORD(lp);
@@ -591,32 +732,49 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             MoveWindow(g_list,           16, 46, list_w, 260, TRUE);
             MoveWindow(g_btn_update_all, bx, 46,  right_w, 40, TRUE);
             MoveWindow(g_btn_update,     bx, 94,  right_w, 34, TRUE);
-            MoveWindow(g_btn_refresh,    bx, 136, right_w, 34, TRUE);
-            MoveWindow(g_btn_settings,   bx, 178, right_w, 34, TRUE);
-            MoveWindow(g_btn_abort,      bx, 220, right_w, 34, TRUE);
-            MoveWindow(g_progress,   16, 318, w-32, 28, TRUE);
-            MoveWindow(g_status_txt, 16, 354, w-32, 20, TRUE);
-            MoveWindow(g_queue_txt,  16, 376, w-32, 20, TRUE);
-            MoveWindow(g_log_txt,    16, 402, w-32, h-418, TRUE);
+            MoveWindow(g_btn_check_all,  bx, 136, right_w, 34, TRUE);
+            MoveWindow(g_btn_refresh,    bx, 178, right_w, 34, TRUE);
+            MoveWindow(g_btn_settings,   bx, 220, right_w, 34, TRUE);
+            MoveWindow(g_btn_abort,      bx, 262, right_w, 34, TRUE);
+            MoveWindow(g_progress,   16, 318, w-32, 30, TRUE);
+            MoveWindow(g_status_txt, 16, 356, w-32, 20, TRUE);
+            MoveWindow(g_queue_txt,  16, 378, w-32, 20, TRUE);
+            MoveWindow(g_log_txt,    16, 404, w-32, h-420, TRUE);
         }
         break;
     }
 
     case WM_GETMINMAXINFO: {
         MINMAXINFO *mmi = (MINMAXINFO *)lp;
-        mmi->ptMinTrackSize.x = 780;
-        mmi->ptMinTrackSize.y = 560;
+        mmi->ptMinTrackSize.x = 800;
+        mmi->ptMinTrackSize.y = 600;
         break;
     }
+
+    case WM_CLOSE:
+        if (g_worker) {
+            if (MessageBoxA(hwnd,
+                    "An update is still running.\n\n"
+                    "Closing now will stop steamcmd and release the account. Close anyway?",
+                    "Update in progress", MB_YESNO | MB_ICONWARNING) != IDYES)
+                return 0;
+        }
+        DestroyWindow(hwnd);
+        return 0;
 
     case WM_DESTROY:
         if (g_worker) {
             g_queue_len = g_queue_pos;
             worker_request_abort();
-            WaitForSingleObject(g_worker, 15000);
+            // Give the worker time to release the lease; otherwise the account
+            // stays 'busy' on the server for up to 90 seconds.
+            if (WaitForSingleObject(g_worker, 20000) == WAIT_TIMEOUT)
+                AppendLog("WARNING: worker did not stop in 20s; server will free the lease itself.");
             CloseHandle(g_worker);
             g_worker = NULL;
         }
+        keep_awake(0);
+        KillTimer(hwnd, ID_TIMER_REFRESH);
         PostQuitMessage(0);
         break;
     }
@@ -624,16 +782,133 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 // ---------------------------------------------------------------------------
-// Progress helper
+// Progress engine
 // ---------------------------------------------------------------------------
-static void SetProgress(double pct, const char *label, int failed) {
+static void DrawProgress(double pct, const char *label, int failed, int warn) {
     g_pct        = pct;
     g_pct_failed = failed;
+    g_pct_warn   = warn;
     if (label && label[0])
-        snprintf(g_pct_label, sizeof(g_pct_label), "%.1f%%  -  %s", pct, label);
+        snprintf(g_pct_label, sizeof(g_pct_label), "%.1f%%   -   %s", pct, label);
     else
         snprintf(g_pct_label, sizeof(g_pct_label), "%.1f%%", pct);
     if (g_progress) InvalidateRect(g_progress, NULL, FALSE);
+}
+
+static void ProgressReset(void) {
+    g_bytes_done   = 0;
+    g_bytes_total  = 0;
+    g_speed_bps    = 0.0;
+    g_bytes_sample = 0;
+    g_tick_bytes   = GetTickCount64();
+    g_tick_sample  = g_tick_bytes;
+    g_tick_job_start = g_tick_bytes;
+    g_stage[0]     = '\0';
+    g_stage_floor  = 0.0;
+}
+
+// Weighted, monotonic mapping from steamcmd's per-stage percentage to a single
+// bar. steamcmd restarts its counter at 0 for every stage (download -> verify
+// -> commit), which is exactly why the old bar jumped backwards.
+static double stage_map(const char *stage, double raw) {
+    if (raw < 0.0)   raw = 0.0;
+    if (raw > 100.0) raw = 100.0;
+    if (!stage || !stage[0]) return raw * 0.90;
+
+    if (strstr(stage, "prealloc"))    return 0.0  + raw * 0.02;   //  0 -  2 %
+    if (strstr(stage, "download"))    return 2.0  + raw * 0.86;   //  2 - 88 %
+    if (strstr(stage, "verif"))       return 88.0 + raw * 0.07;   // 88 - 95 %
+    if (strstr(stage, "commit"))      return 95.0 + raw * 0.04;   // 95 - 99 %
+    if (strstr(stage, "reconfig"))    return 99.0;
+    if (strstr(stage, "validat"))     return 88.0 + raw * 0.07;
+    return raw * 0.90;
+}
+
+static void ProgressUpdate(WorkerState state, double raw_pct,
+                           const char *desc, const char *logline) {
+    ULONGLONG now = GetTickCount64();
+
+    // Stages before steamcmd even starts get a small synthetic slice so the bar
+    // is never frozen at 0 while we talk to the server.
+    if (state == WORKER_ACQUIRING || state == WORKER_KILLING_STEAM) {
+        char lbl[160];
+        snprintf(lbl, sizeof(lbl), "%s", state_name(state));
+        DrawProgress(state == WORKER_ACQUIRING ? 1.0 : 2.0, lbl, 0, 0);
+        return;
+    }
+
+    // Pull byte counters straight out of the steamcmd line:
+    //   Update state (0x61) downloading, progress: 7.36 (371405745 / 5047000673)
+    if (logline && logline[0]) {
+        const char *par = strchr(logline, '(');
+        while (par) {
+            unsigned long long a = 0, b = 0;
+            if (sscanf(par, "(%llu / %llu)", &a, &b) == 2 && b > 0) {
+                if (a != g_bytes_done) g_tick_bytes = now;
+                g_bytes_done  = a;
+                g_bytes_total = b;
+                break;
+            }
+            par = strchr(par + 1, '(');
+        }
+    }
+
+    // Smoothed speed: EMA over ~2 second samples, so the number does not jitter
+    // between 3 MB/s and 90 MB/s twice a second like a 2000s-era downloader.
+    if (now - g_tick_sample >= 1500) {
+        double dt = (double)(now - g_tick_sample) / 1000.0;
+        if (g_bytes_done >= g_bytes_sample && dt > 0.0) {
+            double inst = (double)(g_bytes_done - g_bytes_sample) / dt;
+            g_speed_bps = (g_speed_bps <= 0.0) ? inst : (g_speed_bps * 0.7 + inst * 0.3);
+        }
+        g_bytes_sample = g_bytes_done;
+        g_tick_sample  = now;
+    }
+
+    if (desc && desc[0]) {
+        if (_stricmp(desc, g_stage) != 0) {
+            strncpy(g_stage, desc, sizeof(g_stage) - 1);
+            g_stage[sizeof(g_stage) - 1] = '\0';
+        }
+    }
+
+    double mapped = stage_map(g_stage, raw_pct);
+    // Monotonic guard: the bar may stand still, but it never walks backwards.
+    if (mapped < g_stage_floor) mapped = g_stage_floor;
+    else                        g_stage_floor = mapped;
+
+    // Build the Steam-style label
+    char label[176];
+    char cur[32] = {0}, tot[32] = {0}, spd[32] = {0}, eta[40] = {0};
+    int stalled = (g_bytes_total > 0 && (now - g_tick_bytes) > STALL_WARN_MS);
+
+    if (g_bytes_total > 0) {
+        fmt_bytes(g_bytes_done,  cur, sizeof(cur));
+        fmt_bytes(g_bytes_total, tot, sizeof(tot));
+        if (g_speed_bps > 1024.0) {
+            snprintf(spd, sizeof(spd), "%.1f MB/s", g_speed_bps / (1024.0*1024.0));
+            double left = (double)(g_bytes_total - g_bytes_done) / g_speed_bps;
+            char e[32];
+            fmt_secs(left, e, sizeof(e));
+            snprintf(eta, sizeof(eta), "ETA %s", e);
+        }
+    }
+
+    if (stalled) {
+        snprintf(label, sizeof(label), "%s   -   no new data for %llu s (network? antivirus?)",
+                 g_stage[0] ? g_stage : "working",
+                 (unsigned long long)((now - g_tick_bytes) / 1000));
+    } else if (g_bytes_total > 0 && spd[0]) {
+        snprintf(label, sizeof(label), "%s   %s / %s   %s   %s",
+                 g_stage[0] ? g_stage : "working", cur, tot, spd, eta);
+    } else if (g_bytes_total > 0) {
+        snprintf(label, sizeof(label), "%s   %s / %s",
+                 g_stage[0] ? g_stage : "working", cur, tot);
+    } else {
+        snprintf(label, sizeof(label), "%s", g_stage[0] ? g_stage : state_name(state));
+    }
+
+    DrawProgress(mapped, label, 0, stalled);
 }
 
 // ---------------------------------------------------------------------------
@@ -707,14 +982,33 @@ static void RefreshGameList(void) {
     SendMessage(g_list, WM_SETREDRAW, TRUE, 0);
     InvalidateRect(g_list, NULL, TRUE);
 
-    char buf[128];
+    char buf[160];
     snprintf(buf, sizeof(buf), "List refreshed: %d rows (%d installed on this PC).",
              g_row_count, n_inst);
     AppendLog(buf);
 
-    if (n_inst == 0) {
+    if (n_inst == 0)
         AppendLog("WARNING: no Steam library found. Check that the Steam client is installed.");
+
+    // Warn if there is nowhere legal to install: every fresh install must go to
+    // a non-system disk of at least 500 GB.
+    char win_dir[MAX_PATH] = {0};
+    GetWindowsDirectoryA(win_dir, MAX_PATH);
+    int eligible = 0;
+    for (int j = 0; j < n_inst; j++) {
+        if (!installed[j].library_root[0] || installed[j].library_root[1] != ':') continue;
+        if (win_dir[0] && (installed[j].library_root[0] | 32) == (win_dir[0] | 32)) continue;
+        char root[4] = { installed[j].library_root[0], ':', '\\', '\0' };
+        ULARGE_INTEGER freeb, totalb, avail;
+        if (GetDiskFreeSpaceExA(root, &avail, &totalb, &freeb) &&
+            totalb.QuadPart >= 500ULL*1000ULL*1000ULL*1000ULL) {
+            eligible = 1;
+            break;
+        }
     }
+    if (n_inst > 0 && !eligible)
+        AppendLog("WARNING: no Steam library on a non-system disk of 500 GB or more. "
+                  "Fresh installs will be refused. Add a library on D:/E: in the Steam client.");
 }
 
 // ---------------------------------------------------------------------------
@@ -726,8 +1020,11 @@ static void SetQueueText(void) {
         snprintf(buf, sizeof(buf), "Queue: empty");
     } else {
         int cur = g_queue_pos > 0 ? g_queue_pos : 1;
-        snprintf(buf, sizeof(buf), "Queue: %d / %d   |   OK: %d   Failed: %d",
-                 cur, g_queue_len, g_ok_count, g_fail_count);
+        char el[32] = {0};
+        fmt_secs((double)((GetTickCount64() - g_tick_job_start) / 1000), el, sizeof(el));
+        snprintf(buf, sizeof(buf),
+                 "Queue: %d / %d   |   OK: %d   Failed: %d   |   current game: %s",
+                 cur, g_queue_len, g_ok_count, g_fail_count, el);
     }
     SetWindowTextA(g_queue_txt, buf);
 }
@@ -761,11 +1058,22 @@ static int StartRow(int row_idx) {
             sizeof(g_rows[row_idx].status)-1);
     g_rows[row_idx].result = 3;
     ListView_SetItemText(g_list, row_idx, 4, g_rows[row_idx].status);
+    ListView_EnsureVisible(g_list, row_idx, FALSE);
 
     g_current_row = row_idx;
-    SetProgress(0.0, g_rows[row_idx].installed ? "starting update" : "starting install", 0);
+    ProgressReset();
+    DrawProgress(0.0, g_rows[row_idx].installed ? "starting update" : "starting install", 0, 0);
+
     g_worker = worker_start(&cfg, &g_wstatus);
-    return g_worker != NULL;
+    if (!g_worker) {
+        AppendLog("ERROR: failed to start the worker thread.");
+        g_fail_count++;
+        strncpy(g_rows[row_idx].status, "FAILED: thread", sizeof(g_rows[row_idx].status)-1);
+        g_rows[row_idx].result = 2;
+        ListView_SetItemText(g_list, row_idx, 4, g_rows[row_idx].status);
+        return 0;
+    }
+    return 1;
 }
 
 static void StartQueue(void) {
@@ -783,11 +1091,27 @@ static void StartQueue(void) {
     EnableWindow(g_btn_update, FALSE);
     EnableWindow(g_btn_update_all, FALSE);
     EnableWindow(g_btn_refresh, FALSE);
+    EnableWindow(g_btn_check_all, FALSE);
     EnableWindow(g_btn_abort, TRUE);
+    keep_awake(1);
 
     g_queue_pos = 0;
     SetQueueText();
-    StartRow(g_queue[g_queue_pos++]);
+
+    // Skip rows that fail to start instead of dead-ending the whole queue.
+    while (g_queue_pos < g_queue_len) {
+        int row = g_queue[g_queue_pos++];
+        if (StartRow(row)) break;
+    }
+    if (!g_worker) {
+        EnableWindow(g_btn_update, TRUE);
+        EnableWindow(g_btn_update_all, TRUE);
+        EnableWindow(g_btn_refresh, TRUE);
+        EnableWindow(g_btn_check_all, TRUE);
+        EnableWindow(g_btn_abort, FALSE);
+        keep_awake(0);
+    }
+    SetQueueText();
 }
 
 // ---------------------------------------------------------------------------
@@ -801,6 +1125,7 @@ static void UpdateUIFromWorker(void) {
     strncpy(desc,    g_wstatus.state_desc,   63);   desc[63] = '\0';
     strncpy(logline, g_wstatus.last_log_line, 511); logline[511] = '\0';
     {
+        // Never cut a UTF-8 sequence in half: that used to paint mojibake in the log.
         int n = (int)strlen(logline);
         while (n > 0 && ((unsigned char)logline[n - 1] & 0xC0) == 0x80) n--;
         if (n > 0 && ((unsigned char)logline[n - 1] & 0x80)) n--;
@@ -809,14 +1134,6 @@ static void UpdateUIFromWorker(void) {
     strncpy(errmsg,  g_wstatus.error_msg,    255);  errmsg[255] = '\0';
     LeaveCriticalSection(&g_wstatus.lock);
 
-    SetProgress(pct, desc[0] ? desc : state_name(state), 0);
-
-    char status_buf[320];
-    const char *game = (g_current_row >= 0 && g_current_row < g_row_count)
-                     ? g_rows[g_current_row].name : "";
-    snprintf(status_buf, sizeof(status_buf), "%s  -  %s", game, state_name(state));
-    SetWindowTextA(g_status_txt, status_buf);
-
     static char last_log[512] = {0};
     if (logline[0] && strcmp(logline, last_log) != 0) {
         strncpy(last_log, logline, 511);
@@ -824,7 +1141,20 @@ static void UpdateUIFromWorker(void) {
         AppendLog(logline);
     }
 
-    if (state != WORKER_DONE_OK && state != WORKER_DONE_FAIL) return;
+    if (state != WORKER_DONE_OK && state != WORKER_DONE_FAIL) {
+        ProgressUpdate(state, pct, desc, logline);
+
+        char status_buf[380];
+        const char *game = (g_current_row >= 0 && g_current_row < g_row_count)
+                         ? g_rows[g_current_row].name : "";
+        char el[32];
+        fmt_secs((double)((GetTickCount64() - g_tick_job_start) / 1000), el, sizeof(el));
+        snprintf(status_buf, sizeof(status_buf), "%s  -  %s  -  running for %s%s",
+                 game, state_name(state), el, g_aborting ? "  (aborting)" : "");
+        SetWindowTextA(g_status_txt, status_buf);
+        SetQueueText();
+        return;
+    }
 
     HANDLE hWorker = g_worker;
     g_worker = NULL;   // prevent re-entrant timer calls
@@ -832,17 +1162,26 @@ static void UpdateUIFromWorker(void) {
     if (g_current_row >= 0 && g_current_row < g_row_count) {
         if (state == WORKER_DONE_OK) {
             g_ok_count++;
-            strncpy(g_rows[g_current_row].status, "OK", sizeof(g_rows[g_current_row].status)-1);
+            char st[64];
+            EnterCriticalSection(&g_wstatus.lock);
+            int same_build = (g_wstatus.build_id_before[0] && g_wstatus.build_id_after[0] &&
+                              strcmp(g_wstatus.build_id_before, g_wstatus.build_id_after) == 0);
+            strncpy(g_rows[g_current_row].buildid, g_wstatus.build_id_after,
+                    sizeof(g_rows[g_current_row].buildid)-1);
+            LeaveCriticalSection(&g_wstatus.lock);
+            snprintf(st, sizeof(st), same_build ? "OK (already latest)" : "OK (updated)");
+            strncpy(g_rows[g_current_row].status, st, sizeof(g_rows[g_current_row].status)-1);
             g_rows[g_current_row].installed = 1;
             g_rows[g_current_row].result    = 1;
-            SetProgress(100.0, "complete", 0);
+            ListView_SetItemText(g_list, g_current_row, 3, g_rows[g_current_row].buildid);
+            DrawProgress(100.0, "complete", 0, 0);
             AppendLog(">>> Done.");
         } else {
             g_fail_count++;
             snprintf(g_rows[g_current_row].status, sizeof(g_rows[g_current_row].status),
                      "FAILED: %s", errmsg[0] ? errmsg : "unknown");
             g_rows[g_current_row].result = 2;
-            SetProgress(100.0, errmsg[0] ? errmsg : "failed", 1);
+            DrawProgress(100.0, errmsg[0] ? errmsg : "failed", 1, 0);
             char fail_msg[512];
             snprintf(fail_msg, sizeof(fail_msg), ">>> Failed: %s",
                      errmsg[0] ? errmsg : "Unknown error");
@@ -855,10 +1194,9 @@ static void UpdateUIFromWorker(void) {
     SetQueueText();
 
     // Next game in the queue?
-    if (g_queue_pos < g_queue_len) {
-        StartRow(g_queue[g_queue_pos++]);
-        SetQueueText();
-        return;
+    while (g_queue_pos < g_queue_len) {
+        int row = g_queue[g_queue_pos++];
+        if (StartRow(row)) { SetQueueText(); return; }
     }
 
     // Queue finished
@@ -866,22 +1204,57 @@ static void UpdateUIFromWorker(void) {
     EnableWindow(g_btn_update, TRUE);
     EnableWindow(g_btn_update_all, TRUE);
     EnableWindow(g_btn_refresh, TRUE);
+    EnableWindow(g_btn_check_all, TRUE);
     EnableWindow(g_btn_abort, FALSE);
+    keep_awake(0);
 
     char summary[256];
-    snprintf(summary, sizeof(summary),
-             "Finished. Success: %d, failed: %d.", g_ok_count, g_fail_count);
+    snprintf(summary, sizeof(summary), "%s Success: %d, failed: %d.",
+             g_aborting ? "Aborted." : "Finished.", g_ok_count, g_fail_count);
     SetWindowTextA(g_status_txt, summary);
-    SetProgress(100.0, summary, g_fail_count ? 1 : 0);
+    DrawProgress(100.0, summary, g_fail_count ? 1 : 0, 0);
     AppendLog(summary);
+
+    // Refresh sizes / build ids so the list matches reality after the run.
+    RefreshGameList();
+
     MessageBoxA(g_hwnd, summary, "Update finished",
                 MB_OK | (g_fail_count ? MB_ICONWARNING : MB_ICONINFORMATION));
 }
 
 // ---------------------------------------------------------------------------
-// AppendLog
+// AppendLog: to the on-screen log and to updater.log next to the exe.
+// The file matters: on 50 machines nobody is watching the window, and the
+// exact steamcmd line is the only way to tell a bad password from a dead disk.
 // ---------------------------------------------------------------------------
 static void AppendLog(const char *line) {
+    if (!line) return;
+
+    if (g_logfile[0]) {
+        FILE *f = fopen(g_logfile, "a");
+        if (f) {
+            time_t t = time(NULL);
+            struct tm *lt = localtime(&t);
+            if (lt)
+                fprintf(f, "[%04d-%02d-%02d %02d:%02d:%02d] %s\n",
+                        lt->tm_year + 1900, lt->tm_mon + 1, lt->tm_mday,
+                        lt->tm_hour, lt->tm_min, lt->tm_sec, line);
+            else
+                fprintf(f, "%s\n", line);
+            fclose(f);
+        }
+    }
+
+    if (!g_log_txt) return;
+
+    // Keep the control from growing forever during a long night run.
+    int len = GetWindowTextLengthW(g_log_txt);
+    if (len > 200000) {
+        SendMessageW(g_log_txt, EM_SETSEL, 0, len / 2);
+        SendMessageW(g_log_txt, EM_REPLACESEL, FALSE, (LPARAM)L"[...older lines trimmed...]\r\n");
+        len = GetWindowTextLengthW(g_log_txt);
+    }
+
     int wlen = MultiByteToWideChar(CP_UTF8, 0, line, -1, NULL, 0);
     if (wlen <= 0) return;
 
@@ -893,7 +1266,6 @@ static void AppendLog(const char *line) {
     }
     MultiByteToWideChar(CP_UTF8, 0, line, -1, wline, wlen);
 
-    int len = GetWindowTextLengthW(g_log_txt);
     SendMessageW(g_log_txt, EM_SETSEL, len, len);
     SendMessageW(g_log_txt, EM_REPLACESEL, FALSE, (LPARAM)wline);
     SendMessageW(g_log_txt, EM_REPLACESEL, FALSE, (LPARAM)L"\r\n");
@@ -971,11 +1343,47 @@ LRESULT CALLBACK SettingsDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_COMMAND: {
         if (LOWORD(wp) == ID_BTN_SAVE) {
-            GetWindowTextA(GetDlgItem(hwnd, ID_EDIT_URL),  g_cfg.server_url,    sizeof(g_cfg.server_url));
-            GetWindowTextA(GetDlgItem(hwnd, ID_EDIT_KEY),  g_cfg.api_key,       sizeof(g_cfg.api_key));
-            GetWindowTextA(GetDlgItem(hwnd, ID_EDIT_CMD),  g_cfg.steamcmd_path, sizeof(g_cfg.steamcmd_path));
-            GetWindowTextA(GetDlgItem(hwnd, ID_EDIT_PCID), g_cfg.pc_id,         sizeof(g_cfg.pc_id));
-            config_save(g_cfg_path, &g_cfg);
+            char url[512] = {0}, key[256] = {0}, cmd[MAX_PATH] = {0}, pcid[64] = {0};
+            GetWindowTextA(GetDlgItem(hwnd, ID_EDIT_URL),  url,  sizeof(url));
+            GetWindowTextA(GetDlgItem(hwnd, ID_EDIT_KEY),  key,  sizeof(key));
+            GetWindowTextA(GetDlgItem(hwnd, ID_EDIT_CMD),  cmd,  sizeof(cmd));
+            GetWindowTextA(GetDlgItem(hwnd, ID_EDIT_PCID), pcid, sizeof(pcid));
+
+            // Validate before saving: a typo here means 50 machines fail at 5 AM.
+            if (_strnicmp(url, "http://", 7) != 0 && _strnicmp(url, "https://", 8) != 0) {
+                MessageBoxA(hwnd, "Server URL must start with http:// or https://",
+                            "Invalid URL", MB_OK | MB_ICONERROR);
+                return 0;
+            }
+            size_t ulen = strlen(url);
+            while (ulen > 0 && url[ulen-1] == '/') url[--ulen] = '\0';  // no double slashes
+            if (!key[0]) {
+                MessageBoxA(hwnd, "API key cannot be empty.", "Invalid key", MB_OK | MB_ICONERROR);
+                return 0;
+            }
+            if (cmd[0] && GetFileAttributesA(cmd) == INVALID_FILE_ATTRIBUTES) {
+                if (MessageBoxA(hwnd, "steamcmd.exe was not found at that path. Save anyway?",
+                                "Path not found", MB_YESNO | MB_ICONWARNING) != IDYES)
+                    return 0;
+            }
+            if (!pcid[0]) {
+                // Fall back to the machine name so the server log is still usable.
+                DWORD n = sizeof(pcid);
+                GetComputerNameA(pcid, &n);
+            }
+
+            strncpy(g_cfg.server_url,    url,  sizeof(g_cfg.server_url)-1);
+            strncpy(g_cfg.api_key,       key,  sizeof(g_cfg.api_key)-1);
+            strncpy(g_cfg.steamcmd_path, cmd,  sizeof(g_cfg.steamcmd_path)-1);
+            strncpy(g_cfg.pc_id,         pcid, sizeof(g_cfg.pc_id)-1);
+
+            if (!config_save(g_cfg_path, &g_cfg)) {
+                MessageBoxA(hwnd,
+                    "Could not write updater.ini.\nRun the updater as administrator or move it "
+                    "out of Program Files.", "Save failed", MB_OK | MB_ICONERROR);
+                return 0;
+            }
+            AppendLog("Settings saved.");
             DestroyWindow(hwnd);
         }
         else if (LOWORD(wp) == ID_BTN_BROWSE) {
