@@ -1,6 +1,9 @@
 // steamcmd.c - SteamCMD process manager implementation
-// Uses runscript file approach (confirmed reliable vs stdin-pipe on Windows)
-// Runscript file is written, used, and deleted immediately after process start.
+// Uses the runscript file approach (reliable on Windows, unlike stdin piping).
+//
+// IMPORTANT ordering rule: force_install_dir must be issued BEFORE login.
+// If it comes after login SteamCMD silently ignores it and installs into its
+// own default library - which is exactly what caused full re-downloads.
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <tlhelp32.h>
@@ -21,35 +24,41 @@ static void make_runscript_path(char *out, int out_size) {
 }
 
 // ---------------------------------------------------------------------------
-// Internal: write the runscript file (deleted right after process starts)
-// Password is cleared from the buffer after write.
+// Internal: write the runscript file
 // ---------------------------------------------------------------------------
 static int write_runscript(const char *path, const SteamCmdJob *job) {
     HANDLE h = CreateFileA(path, GENERIC_WRITE, 0, NULL,
                            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (h == INVALID_HANDLE_VALUE) return 0;
 
-    char line[512];
+    char line[MAX_PATH + 256];
     DWORD written;
 
-    // Directives
     WriteFile(h, "@ShutdownOnFailedCommand 1\r\n",
               (DWORD)strlen("@ShutdownOnFailedCommand 1\r\n"), &written, NULL);
     WriteFile(h, "@NoPromptForPassword 1\r\n",
               (DWORD)strlen("@NoPromptForPassword 1\r\n"), &written, NULL);
+    WriteFile(h, "@sSteamCmdForcePlatformType windows\r\n",
+              (DWORD)strlen("@sSteamCmdForcePlatformType windows\r\n"), &written, NULL);
+
+    // force_install_dir BEFORE login - this is the whole point of the fix.
+    if (job->install_dir[0]) {
+        snprintf(line, sizeof(line), "force_install_dir \"%s\"\r\n", job->install_dir);
+        WriteFile(h, line, (DWORD)strlen(line), &written, NULL);
+    }
 
     // Login
     snprintf(line, sizeof(line), "login %s %s\r\n", job->login, job->password);
     WriteFile(h, line, (DWORD)strlen(line), &written, NULL);
     SecureZeroMemory(line, sizeof(line));
 
-    // F2P license request
+    // F2P license request (must come after login)
     if (job->is_f2p) {
         snprintf(line, sizeof(line), "app_license_request %s\r\n", job->app_id);
         WriteFile(h, line, (DWORD)strlen(line), &written, NULL);
     }
 
-    // Update
+    // Update (validate = compare local chunks, download only the delta)
     snprintf(line, sizeof(line), "app_update %s validate\r\n", job->app_id);
     WriteFile(h, line, (DWORD)strlen(line), &written, NULL);
 
@@ -65,65 +74,101 @@ static int write_runscript(const char *path, const SteamCmdJob *job) {
 static void parse_progress_line(const char *line,
                                 SteamCmdProgressCb cb, void *userdata) {
     if (!cb) return;
-    // Look for "progress: "
+
     const char *p = strstr(line, "progress: ");
-    if (!p) return;
+    if (!p) {
+        // Stages without a percentage still deserve a UI update
+        if (strstr(line, "Logging in user") || strstr(line, "Connecting anonymously"))
+            cb(-1.0, "logging in", userdata);
+        else if (strstr(line, "Waiting for client config"))
+            cb(-1.0, "connecting", userdata);
+        else if (strstr(line, "Waiting for user info"))
+            cb(-1.0, "connecting", userdata);
+        else if (strstr(line, "Update state") && strstr(line, "preallocating"))
+            cb(-1.0, "preallocating", userdata);
+        return;
+    }
     p += 10;
 
     double pct = 0.0;
     if (sscanf(p, "%lf", &pct) != 1) return;
 
-    // State: look for (0xNN) token
     const char *state = "unknown";
-    if (strstr(line, "0x61"))       state = "downloading";
-    else if (strstr(line, "0x81"))  state = "verifying";
-    else if (strstr(line, "0x101")) state = "committing";
-    else if (strstr(line, "0x3"))   state = "reconfiguring";
+    if      (strstr(line, "downloading"))    state = "downloading";
+    else if (strstr(line, "verifying"))      state = "verifying";
+    else if (strstr(line, "validating"))     state = "validating";
+    else if (strstr(line, "committing"))     state = "committing";
+    else if (strstr(line, "preallocating"))  state = "preallocating";
+    else if (strstr(line, "reconfiguring"))  state = "reconfiguring";
+    else if (strstr(line, "0x61"))           state = "downloading";
+    else if (strstr(line, "0x81"))           state = "verifying";
+    else if (strstr(line, "0x101"))          state = "committing";
 
     cb(pct, state, userdata);
 }
 
 // ---------------------------------------------------------------------------
-// Internal: check if "Success! App 'XXXX' fully installed." appears in line
+// Internal: success detection
 // ---------------------------------------------------------------------------
 static int is_success_line(const char *line, const char *app_id) {
     char pattern[64];
     snprintf(pattern, sizeof(pattern), "App '%s'", app_id);
     if (!strstr(line, pattern)) return 0;
 
-    // Check English + Russian success prefixes (both CP1251 and UTF-8 byte forms)
     if (strstr(line, "Success!") ||
-        strstr(line, "\xD3\xF1\xEF\xE5\xF5!") ||                      // "Успех!" CP1251
-        strstr(line, "\xD0\xA3\xD1\x81\xD0\xBF\xD0\xB5\xD1\x85!"))   // "Успех!" UTF-8
+        strstr(line, "\xD3\xF1\xEF\xE5\xF5!") ||                      // "Uspeh!" CP1251
+        strstr(line, "\xD0\xA3\xD1\x81\xD0\xBF\xD0\xB5\xD1\x85!"))   // "Uspeh!" UTF-8
         return 1;
 
-    // Fallback: check for explicit completion words without the prefix
     if (strstr(line, "fully installed") || strstr(line, "already up to date")) return 1;
 
     return 0;
 }
 
 // ---------------------------------------------------------------------------
-// Internal: classify error from a log line
+// Internal: classify error from the accumulated log
+//
+// "No subscription" is a LICENSING problem, not a network one. Reporting it as
+// a CDN error hid the real cause (the account simply does not own the app),
+// so the server never learned to hand out a different account.
 // ---------------------------------------------------------------------------
 static SteamCmdResult classify_error(const char *log, int exit_code) {
-    if (strstr(log, "No subscription"))          return STEAMCMD_ERROR_NETWORK;
-    if (strstr(log, "Invalid Platform"))         return STEAMCMD_ERROR_NETWORK;
+    if (strstr(log, "No subscription"))          return STEAMCMD_ERROR_NO_LICENSE;
+    if (strstr(log, "Invalid Platform"))         return STEAMCMD_ERROR_NO_LICENSE;
     if (strstr(log, "Login Failure") ||
-        strstr(log, "Invalid Password"))         return STEAMCMD_ERROR_AUTH;
+        strstr(log, "Invalid Password") ||
+        strstr(log, "Account Logon Denied") ||
+        strstr(log, "RateLimitExceeded"))        return STEAMCMD_ERROR_AUTH;
     if (strstr(log, "Steam Guard") ||
         strstr(log, "two-factor") ||
         strstr(log, "confirmation code"))        return STEAMCMD_ERROR_AUTH;
+    if (strstr(log, "Disk write failure") ||
+        strstr(log, "Not enough disk space") ||
+        strstr(log, "Disk Full"))                return STEAMCMD_ERROR_DISK;
     if (strstr(log, "Timeout") ||
         strstr(log, "rate limit") ||
-        strstr(log, "RateLimit"))                return STEAMCMD_ERROR_NETWORK;
+        strstr(log, "RateLimit") ||
+        strstr(log, "Missing file privileges") ||
+        strstr(log, "Update Required"))          return STEAMCMD_ERROR_NETWORK;
 
-    // If SteamCMD exited cleanly (0) or with generic success (7), and no fatal errors found
     if (exit_code == 0 || exit_code == 7) {
         return STEAMCMD_SUCCESS;
     }
 
     return STEAMCMD_ERROR_UNKNOWN;
+}
+
+const char *steamcmd_result_name(SteamCmdResult r) {
+    switch (r) {
+        case STEAMCMD_SUCCESS:          return "Success";
+        case STEAMCMD_ERROR_NETWORK:    return "Network/CDN error";
+        case STEAMCMD_ERROR_AUTH:       return "Authentication failure";
+        case STEAMCMD_ERROR_PROCESS:    return "Could not start SteamCMD";
+        case STEAMCMD_ERROR_TIMEOUT:    return "SteamCMD timeout";
+        case STEAMCMD_ERROR_NO_LICENSE: return "Account has no license for this app";
+        case STEAMCMD_ERROR_DISK:       return "Disk write failure / not enough space";
+        default:                        return "Unknown SteamCMD error";
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -175,7 +220,7 @@ int steam_client_kill(void) {
         } while (Process32Next(snap, &pe));
     }
     CloseHandle(snap);
-    Sleep(1000); // give it a moment to die
+    Sleep(1000);
     return 1;
 }
 
@@ -183,7 +228,6 @@ int steam_client_kill(void) {
 // Main: run SteamCMD update job
 // ---------------------------------------------------------------------------
 SteamCmdResult steamcmd_run(const SteamCmdJob *job) {
-    // 1. Write runscript file
     char script_path[MAX_PATH];
     make_runscript_path(script_path, MAX_PATH);
 
@@ -191,19 +235,11 @@ SteamCmdResult steamcmd_run(const SteamCmdJob *job) {
         return STEAMCMD_ERROR_PROCESS;
     }
 
-    // 2. Build command line
-    // steamcmd.exe +runscript "..."
-    // НЕ используем +force_install_dir: на cmdline (а login — внутри runscript)
-    // он молча игнорируется, и SteamCMD ставит игру в свою дефолтную библиотеку
-    // с полной закачкой. Вместо этого worker.c прописывает нативную библиотеку
-    // Steam в <папка steamcmd>\steamapps\libraryfolders.vdf — и SteamCMD сам
-    // находит уже установленную игру и обновляет её НА МЕСТЕ (validate → дельта).
     char cmdline[MAX_PATH * 3 + 128];
     snprintf(cmdline, sizeof(cmdline),
              "\"%s\" +runscript \"%s\"",
              job->steamcmd_path, script_path);
 
-    // 3. Setup process with stdout pipe
     SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
     HANDLE pipe_read  = NULL;
     HANDLE pipe_write = NULL;
@@ -213,14 +249,13 @@ SteamCmdResult steamcmd_run(const SteamCmdJob *job) {
     }
     SetHandleInformation(pipe_read, HANDLE_FLAG_INHERIT, 0);
 
-    // Create a null device handle for stdin so SteamCMD never waits for user input
     HANDLE null_stdin = CreateFileA("NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
                                     &sa, OPEN_EXISTING, 0, NULL);
 
     STARTUPINFOA si = { sizeof(si) };
     si.dwFlags    = STARTF_USESTDHANDLES;
     si.hStdOutput = pipe_write;
-    si.hStdError  = pipe_write;  // merge stderr into stdout
+    si.hStdError  = pipe_write;
     si.hStdInput  = (null_stdin != INVALID_HANDLE_VALUE) ? null_stdin : NULL;
 
     PROCESS_INFORMATION pi = {0};
@@ -233,18 +268,23 @@ SteamCmdResult steamcmd_run(const SteamCmdJob *job) {
         return STEAMCMD_ERROR_PROCESS;
     }
 
-    // Close write end in parent (so ReadFile returns when child exits)
     CloseHandle(pipe_write);
-    // Close null stdin handle in parent (child has its own copy)
     if (null_stdin != INVALID_HANDLE_VALUE) CloseHandle(null_stdin);
 
-    // Assign SteamCMD to Job Object (kill-on-close guarantee)
     if (job->job_object) {
         AssignProcessToJobObject(job->job_object, pi.hProcess);
     }
 
-    // 4. (Runscript will be deleted after process exits to prevent interactive hang)
-    // 5. Read stdout line by line, parse progress, accumulate log
+    // The runscript holds a plaintext password. SteamCMD reads it during
+    // startup, so overwrite the contents as soon as the process is running
+    // instead of leaving it readable in %TEMP% for the whole download.
+    Sleep(1500);
+    {
+        HANDLE hz = CreateFileA(script_path, GENERIC_WRITE, 0, NULL,
+                                TRUNCATE_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (hz != INVALID_HANDLE_VALUE) CloseHandle(hz);
+    }
+
     char  log_buf[65536] = {0};
     int   log_pos        = 0;
     char  line_buf[4096] = {0};
@@ -256,14 +296,12 @@ SteamCmdResult steamcmd_run(const SteamCmdJob *job) {
     int   success          = 0;
 
     while (1) {
-        // Check user abort
         if (job->abort_flag && *job->abort_flag) {
             TerminateProcess(pi.hProcess, 1);
-            result = STEAMCMD_ERROR_UNKNOWN;  // will be overridden by aborted flag in worker
+            result = STEAMCMD_ERROR_UNKNOWN;
             break;
         }
 
-        // Check timeout
         if (job->timeout_ms > 0) {
             DWORD elapsed = GetTickCount() - last_output_tick;
             if (elapsed > job->timeout_ms) {
@@ -273,12 +311,8 @@ SteamCmdResult steamcmd_run(const SteamCmdJob *job) {
             }
         }
 
-        // Non-blocking peek
         DWORD avail = 0;
         if (!PeekNamedPipe(pipe_read, NULL, 0, NULL, &avail, NULL)) {
-            // Broken pipe => child exited and its stdout write-end is gone.
-            // Flush any partial line, then classify by exit code instead of
-            // breaking out with the default STEAMCMD_ERROR_UNKNOWN.
             DWORD exit_code = 0;
             GetExitCodeProcess(pi.hProcess, &exit_code);
             if (line_pos > 0) {
@@ -299,14 +333,11 @@ SteamCmdResult steamcmd_run(const SteamCmdJob *job) {
         }
 
         if (avail == 0) {
-            // Check if process is still alive
             DWORD exit_code;
             if (GetExitCodeProcess(pi.hProcess, &exit_code) &&
                 exit_code != STILL_ACTIVE) {
-                // Drain remaining output
                 while (ReadFile(pipe_read, read_buf, sizeof(read_buf)-1,
                                 &bytes_read, NULL) && bytes_read > 0) {
-                    // process lines below
                     for (DWORD i = 0; i < bytes_read; i++) {
                         char c = read_buf[i];
                         if (c == '\n' || c == '\r') {
@@ -335,7 +366,6 @@ SteamCmdResult steamcmd_run(const SteamCmdJob *job) {
             continue;
         }
 
-        // Read available data
         if (!ReadFile(pipe_read, read_buf,
                       avail < sizeof(read_buf)-1 ? avail : sizeof(read_buf)-1,
                       &bytes_read, NULL) || bytes_read == 0) break;
@@ -367,7 +397,6 @@ SteamCmdResult steamcmd_run(const SteamCmdJob *job) {
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
 
-    // 6. Delete script file after SteamCMD has finished
     DeleteFileA(script_path);
 
     return result;

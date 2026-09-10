@@ -17,6 +17,28 @@ typedef struct {
     char game_path[MAX_PATH];      // library_root\steamapps\common\installdir
 } AcfInfo;
 
+// Resolve the Steam client install root.
+// Order: HKLM\SOFTWARE\WOW6432Node\Valve\Steam!InstallPath (machine-wide, works
+// under SYSTEM / Task Scheduler), then the 32/64-bit views of HKLM\SOFTWARE\
+// Valve\Steam, then HKCU\Software\Valve\Steam!SteamPath, then common locations
+// on disk. Returns 0 if Steam could not be found (never silently guesses).
+int  acf_get_steam_root(char *out, int out_size);
+
+// List every Steam library root (client root + libraryfolders.vdf entries).
+// Returns the number of roots written into roots[].
+int  acf_list_libraries(char roots[][MAX_PATH], int max_roots);
+
+// Pick the library with the most free space - used as install target for games
+// that are not installed yet. Returns 0 if no library was found.
+int  acf_pick_install_library(char *out, int out_size);
+
+// Copy the appmanifest SteamCMD generated (<steamcmd dir>\steamapps\
+// appmanifest_<appid>.acf) into the Steam client library and rewrite its
+// "installdir" field so the client sees the game as installed.
+// Returns 1 on success.
+int  acf_import_manifest(const char *steamcmd_path, const char *app_id,
+                         const char *target_library, const char *installdir);
+
 // Find the Steam library root from registry, then scan all libraries
 // Returns number of games found, fills out[] (max_out entries)
 int  acf_scan_libraries(AcfInfo *out, int max_out);

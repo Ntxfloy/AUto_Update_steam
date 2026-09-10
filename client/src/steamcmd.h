@@ -15,10 +15,12 @@ typedef void (*SteamCmdLogCb)(const char *line, void *userdata);
 // Result of a SteamCMD run
 typedef enum {
     STEAMCMD_SUCCESS = 0,       // "Success! App fully installed."
-    STEAMCMD_ERROR_NETWORK,     // CDN timeout / no subscription
+    STEAMCMD_ERROR_NETWORK,     // CDN timeout / rate limit
     STEAMCMD_ERROR_AUTH,        // Login failure / Steam Guard
     STEAMCMD_ERROR_PROCESS,     // Could not start process
     STEAMCMD_ERROR_TIMEOUT,     // No output for too long
+    STEAMCMD_ERROR_NO_LICENSE,  // "No subscription" - account does not own the app
+    STEAMCMD_ERROR_DISK,        // Disk write failure / not enough space
     STEAMCMD_ERROR_UNKNOWN      // Non-zero exit code, other
 } SteamCmdResult;
 
@@ -27,8 +29,10 @@ typedef struct {
     char  steamcmd_path[MAX_PATH];  // e.g. C:\steamcmd\steamcmd.exe
     char  login[128];               // Steam account login
     char  password[256];            // plaintext password (zeroed after use)
-    char  app_id[32];               // e.g. "427520"
-    char  library_root[MAX_PATH];   // force_install_dir target
+    char  app_id[32];               // e.g. "730"
+    char  library_root[MAX_PATH];   // Steam library root the game belongs to
+    char  install_dir[MAX_PATH];    // force_install_dir target = the GAME folder
+                                    // (library\steamapps\common\installdir)
     int   is_f2p;                   // 1 = send app_license_request
     DWORD timeout_ms;               // max ms without output before abort (0 = no limit)
 
@@ -41,8 +45,10 @@ typedef struct {
 
 // Run SteamCMD for one update job.
 // Blocks until SteamCMD exits or timeout.
-// Returns result code.
 SteamCmdResult steamcmd_run(const SteamCmdJob *job);
+
+// Human-readable name for a result code
+const char *steamcmd_result_name(SteamCmdResult r);
 
 // Kill all running steamcmd.exe processes (cleanup before starting)
 void steamcmd_kill_all(void);
