@@ -10,6 +10,7 @@ SRCS = $(SRC_DIR)/main.c \
        $(SRC_DIR)/config.c \
        $(SRC_DIR)/acf.c \
        $(SRC_DIR)/catalog.c \
+       $(SRC_DIR)/log.c \
        $(SRC_DIR)/steamcmd.c \
        $(SRC_DIR)/api.c \
        $(SRC_DIR)/lease.c \
