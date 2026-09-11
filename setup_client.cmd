@@ -183,30 +183,51 @@ if "!NEEDS_WRITE!"=="1" (
 )
 
 rem 5. Desktop Shortcut
-set "DESKTOP_DIR=%USERPROFILE%\Desktop"
-for /f "usebackq delims=" %%D in (`powershell -NoProfile -ExecutionPolicy Bypass -Command "[Environment]::GetFolderPath('Desktop')" 2^>nul`) do (
-    if exist "%%D" set "DESKTOP_DIR=%%D"
-)
-set "SHORTCUT_FILE=!DESKTOP_DIR!\Steam Auto-Updater.lnk"
-set "ALT_SHORTCUT=!DESKTOP_DIR!\Steam Updater.lnk"
+set "DESK_PUBLIC=%PUBLIC%\Desktop"
+set "DESK_USER=%USERPROFILE%\Desktop"
 
-if exist "!SHORTCUT_FILE!" (
-    echo [+] Desktop shortcut already exists: Steam Auto-Updater.lnk
-) else if exist "!ALT_SHORTCUT!" (
-    echo [+] Desktop shortcut already exists: Steam Updater.lnk
+set "SHORTCUT_EXISTS=0"
+if exist "!DESK_PUBLIC!\Steam Auto-Updater.lnk" set "SHORTCUT_EXISTS=1"
+if exist "!DESK_PUBLIC!\Steam Updater.lnk" set "SHORTCUT_EXISTS=1"
+if exist "!DESK_USER!\Steam Auto-Updater.lnk" set "SHORTCUT_EXISTS=1"
+if exist "!DESK_USER!\Steam Updater.lnk" set "SHORTCUT_EXISTS=1"
+
+if "!SHORTCUT_EXISTS!"=="1" (
+    echo [+] Desktop shortcut already exists.
 ) else (
     echo [*] Creating Desktop shortcut...
+    set "TARGET_DESK=!DESK_USER!"
+    if exist "!DESK_PUBLIC!" (
+        2>nul (>>"!DESK_PUBLIC!\.chk" echo 1) && (
+            del "!DESK_PUBLIC!\.chk" >nul 2>&1
+            set "TARGET_DESK=!DESK_PUBLIC!"
+        )
+    )
+    set "SHORTCUT_FILE=!TARGET_DESK!\Steam Auto-Updater.lnk"
     powershell -NoProfile -ExecutionPolicy Bypass -Command ^
         "$ws = New-Object -ComObject WScript.Shell;" ^
         "$s = $ws.CreateShortcut('!SHORTCUT_FILE!');" ^
         "$s.TargetPath = '!CLIENT_EXE!';" ^
         "$s.WorkingDirectory = '!TARGET_DIR!';" ^
-        "$s.Description = 'Steam Auto-Updater Client';" ^
+        "$s.Description = 'Steam Auto-Updater';" ^
         "$s.Save();"
+    
     if exist "!SHORTCUT_FILE!" (
-        echo [+] Desktop shortcut created: Steam Auto-Updater.lnk
+        echo [+] Desktop shortcut created: !SHORTCUT_FILE!
+    ) else (
+        rem Fallback to user desktop if public failed
+        set "SHORTCUT_FILE=!DESK_USER!\Steam Auto-Updater.lnk"
+        powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+            "$ws = New-Object -ComObject WScript.Shell;" ^
+            "$s = $ws.CreateShortcut('!SHORTCUT_FILE!');" ^
+            "$s.TargetPath = '!CLIENT_EXE!';" ^
+            "$s.WorkingDirectory = '!TARGET_DIR!';" ^
+            "$s.Description = 'Steam Auto-Updater';" ^
+            "$s.Save();"
+        if exist "!SHORTCUT_FILE!" echo [+] Desktop shortcut created: !SHORTCUT_FILE!
     )
 )
+
 
 echo ===================================================
 echo   Setup Complete! Everything is ready in:
