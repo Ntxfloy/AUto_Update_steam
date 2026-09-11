@@ -42,14 +42,27 @@ echo   Target Server: !SERVER_URL!
 echo ===================================================
 
 rem ---------------------------------------------------
-rem 1. Choose the target drive
+rem 1. Choose the target folder
 rem
-rem "if exist D:\" was not enough: D: can be a DVD drive, a card reader or a
-rem mounted USB stick on some machines, and then the whole updater would land
-rem on removable media. We ask Windows for real fixed disks (DriveType=3) with
-rem at least 3 GB free and take the first one in order of preference.
-rem If PowerShell is unavailable for any reason we fall back to the old logic.
+rem Rule 1: if the machine is already deployed, keep the folder it uses.
+rem Re-running the script on a configured PC must never create a second
+rem copy on another drive while the desktop shortcuts still point at the
+rem old one.
+rem
+rem Rule 2 (clean machine only): "if exist D:\" was not enough - D: can be
+rem a DVD drive, a card reader or a mounted USB stick on some machines, and
+rem then the whole updater would land on removable media. We ask Windows for
+rem real fixed disks (DriveType=3) with at least 3 GB free and take the
+rem first one in order of preference. If PowerShell is unavailable for any
+rem reason we fall back to the old logic.
 rem ---------------------------------------------------
+set "EXISTING_DIR="
+for %%D in (D: E: F: G: C:) do (
+    if not defined EXISTING_DIR if exist "%%D\SteamUpdater\steam_updater.exe" set "EXISTING_DIR=%%D\SteamUpdater"
+)
+
+if defined EXISTING_DIR goto :have_target
+
 set "TARGET_DRIVE="
 for /f "usebackq delims=" %%D in (`powershell -NoProfile -ExecutionPolicy Bypass -Command "$pref=@('D:','E:','F:','G:','C:'); $fixed=Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' -ErrorAction SilentlyContinue; foreach($x in $pref){ $m=$fixed ^| Where-Object { $_.DeviceID -eq $x -and $_.FreeSpace -gt 3GB }; if($m){ Write-Output $x; break } }"`) do set "TARGET_DRIVE=%%D"
 
@@ -59,6 +72,13 @@ if not defined TARGET_DRIVE (
 )
 
 set "TARGET_DIR=!TARGET_DRIVE!\SteamUpdater"
+goto :target_ready
+
+:have_target
+set "TARGET_DIR=!EXISTING_DIR!"
+echo [+] Existing installation detected, keeping it.
+
+:target_ready
 if not exist "!TARGET_DIR!" mkdir "!TARGET_DIR!"
 echo [*] Target folder: !TARGET_DIR!
 
