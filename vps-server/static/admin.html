@@ -32,12 +32,12 @@
   main{padding:22px;max-width:var(--wrap);margin:0 auto;width:100%}
   .page{display:none} .page.active{display:block}
   .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:22px}
-  .card{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:14px 16px}
+  .card{background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:14px 16px}
   .card .v{font-size:26px;font-weight:600}
   .card .l{color:var(--dim);font-size:12px;text-transform:uppercase;letter-spacing:.5px}
   /* Wide rows scroll inside their own box instead of stretching the page. */
   .table-wrap{width:100%;overflow-x:auto;border:1px solid var(--border);
-    border-radius:10px;background:var(--panel)}
+    border-radius:14px;background:var(--panel)}
   table{width:100%;border-collapse:collapse;background:var(--panel);min-width:640px}
   th{text-align:left;padding:10px 12px;background:var(--panel2);color:var(--dim);
     font-size:12px;text-transform:uppercase;letter-spacing:.4px;font-weight:600;
@@ -50,20 +50,20 @@
   .s-bad{background:rgba(239,68,68,.15);color:var(--fail)}
   .s-disabled{background:rgba(154,154,164,.15);color:var(--dim)}
   button{background:var(--panel2);color:var(--text);border:1px solid var(--border);
-    border-radius:8px;padding:8px 14px;cursor:pointer;font:inherit;transition:.12s}
+    border-radius:10px;padding:8px 14px;cursor:pointer;font:inherit;transition:.12s}
   button:hover{background:#32323a;border-color:#4a4a52}
   button.primary{background:var(--accent);border-color:var(--accent);font-weight:600}
   button.primary:hover{background:var(--accent2);border-color:var(--accent2)}
   button.danger:hover{background:rgba(239,68,68,.18);border-color:var(--fail);color:#fca5a5}
-  button.sm{padding:4px 9px;font-size:12px}
+  button.sm{padding:4px 9px;font-size:12px;border-radius:8px}
   button:disabled{opacity:.45;cursor:not-allowed}
   input,textarea,select{background:#1c1c20;color:var(--text);border:1px solid var(--border);
-    border-radius:8px;padding:9px 11px;font:inherit;width:100%;max-width:100%}
+    border-radius:10px;padding:9px 11px;font:inherit;width:100%;max-width:100%}
   input:focus,textarea:focus{outline:none;border-color:var(--accent)}
   textarea{min-height:230px;font-family:Consolas,monospace;font-size:13px;resize:vertical}
   label{display:block;color:var(--dim);font-size:12px;margin:0 0 5px}
   .row{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-bottom:14px}
-  pre{background:#141417;border:1px solid var(--border);border-radius:10px;padding:14px;
+  pre{background:#141417;border:1px solid var(--border);border-radius:14px;padding:14px;
     overflow:auto;max-height:65vh;font-family:Consolas,monospace;font-size:12.5px;
     white-space:pre-wrap;word-break:break-word}
   .hint{color:var(--dim);font-size:12.5px}
@@ -73,7 +73,7 @@
   #keyBox input{width:230px}
   .toast{position:fixed;right:18px;bottom:18px;background:var(--panel);
     border:1px solid var(--border);border-left:3px solid var(--accent);
-    border-radius:8px;padding:12px 16px;max-width:400px;box-shadow:0 8px 24px #0008;
+    border-radius:10px;padding:12px 16px;max-width:400px;box-shadow:0 8px 24px #0008;
     opacity:0;transform:translateY(10px);transition:.2s;pointer-events:none}
   .toast.show{opacity:1;transform:none}
   .toast.err{border-left-color:var(--fail)}
@@ -211,6 +211,8 @@ let KEY = localStorage.getItem("steamAdminKey") || "";
 let DATA = { accounts: [], pcs: [] };
 let timer = null, logTimer = null;
 
+const TABS = ["overview", "accounts", "bulk", "log", "srvlog"];
+
 function toast(msg, kind){
   const t = document.getElementById("toast");
   t.textContent = msg;
@@ -284,6 +286,7 @@ async function refresh(){
 function renderAccounts(){
   const f = (document.getElementById("accFilter").value || "").toLowerCase();
   const st = document.getElementById("accStatus").value;
+  localStorage.setItem("steamAdminAccStatus", st);
   const rows = DATA.accounts.filter(a =>
     (!f || a.login.toLowerCase().includes(f)) && (!st || a.status === st));
   document.getElementById("accBody").innerHTML = rows.length ? rows.map(a => `
@@ -361,6 +364,8 @@ async function loadLog(){
   const p = new URLSearchParams({ limit: "150" });
   const r = document.getElementById("logResult").value;
   const pc = document.getElementById("logPc").value.trim();
+  localStorage.setItem("steamAdminLogResult", r);
+  localStorage.setItem("steamAdminLogPc", pc);
   if (r) p.set("result", r);
   if (pc) p.set("pc_id", pc);
   try {
@@ -383,14 +388,30 @@ async function loadServerLog(){
   } catch(e){ toast(e.message, "err"); }
 }
 
-document.querySelectorAll(".tab").forEach(t => t.onclick = () => {
-  document.querySelectorAll(".tab").forEach(x => x.classList.remove("active"));
+// --- Tabs ------------------------------------------------------------------
+// The active tab is kept in localStorage AND in the URL hash, so F5 (or a
+// restarted server) puts you back where you were instead of always throwing
+// you to the Overview page.
+function showTab(name, push){
+  if (TABS.indexOf(name) < 0) name = "overview";
+  document.querySelectorAll(".tab").forEach(x =>
+    x.classList.toggle("active", x.dataset.p === name));
   document.querySelectorAll(".page").forEach(x => x.classList.remove("active"));
-  t.classList.add("active");
-  document.getElementById("p-" + t.dataset.p).classList.add("active");
-  if (t.dataset.p === "log") loadLog();
-  if (t.dataset.p === "srvlog") loadServerLog();
-});
+  const page = document.getElementById("p-" + name);
+  if (page) page.classList.add("active");
+  localStorage.setItem("steamAdminTab", name);
+  if (push && location.hash !== "#" + name){
+    history.replaceState(null, "", "#" + name);
+  }
+  if (name === "log") loadLog();
+  if (name === "srvlog") loadServerLog();
+}
+
+document.querySelectorAll(".tab").forEach(t =>
+  t.onclick = () => showTab(t.dataset.p, true));
+window.addEventListener("hashchange",
+  () => showTab((location.hash || "").replace("#", ""), false));
+
 document.getElementById("bulkText").addEventListener("input", countLines);
 document.getElementById("apiKey").addEventListener("keydown",
   e => { if (e.key === "Enter") saveKey(); });
@@ -398,10 +419,26 @@ document.getElementById("logPc").addEventListener("keydown",
   e => { if (e.key === "Enter") loadLog(); });
 document.getElementById("autoLog").addEventListener("change", e => {
   clearInterval(logTimer);
+  localStorage.setItem("steamAdminAutoLog", e.target.checked ? "1" : "0");
   if (e.target.checked) logTimer = setInterval(loadServerLog, 3000);
 });
 
+// --- Restore the previous session -----------------------------------------
 if (KEY) document.getElementById("apiKey").value = KEY;
+document.getElementById("accStatus").value =
+  localStorage.getItem("steamAdminAccStatus") || "";
+document.getElementById("logResult").value =
+  localStorage.getItem("steamAdminLogResult") || "";
+document.getElementById("logPc").value =
+  localStorage.getItem("steamAdminLogPc") || "";
+if (localStorage.getItem("steamAdminAutoLog") === "1"){
+  document.getElementById("autoLog").checked = true;
+  logTimer = setInterval(loadServerLog, 3000);
+}
+
+showTab((location.hash || "").replace("#", "") ||
+        localStorage.getItem("steamAdminTab") || "overview", true);
+
 refresh();
 timer = setInterval(() => { if (!document.hidden) refresh(); }, 5000);
 </script>
