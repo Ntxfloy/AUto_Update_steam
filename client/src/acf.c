@@ -6,6 +6,13 @@
 #include <time.h>
 #include "acf.h"
 
+// A sane upper bound for a manifest / libraryfolders.vdf. Anything bigger is
+// not a VDF file and must not be pulled into memory.
+#define ACF_MAX_FILE_BYTES  (16 * 1024 * 1024)
+
+// Never treat a disk smaller than this (total size) as an install target.
+#define ACF_MIN_DISK_BYTES  (500ULL * 1000ULL * 1000ULL * 1000ULL)
+
 // ---------------------------------------------------------------------------
 // Internal: extract a VDF string field value
 // Format: "FieldName"    "Value"
@@ -33,18 +40,59 @@ static int vdf_extract(const char *buf, const char *field, char *out, int out_si
 
 // ---------------------------------------------------------------------------
 // Read entire file into a heap buffer (caller must free)
+//
+// Three things were wrong before and all three cost us games in the list:
+//  * FILE_SHARE_READ only. The Steam client keeps appmanifest_*.acf open for
+//    writing while it is running, so the open failed with a sharing violation
+//    and the game silently disappeared from the UI. We now allow the writers
+//    and retry a few times if the file is briefly locked anyway.
+//  * GetFileSize has no error handling: INVALID_FILE_SIZE (0xFFFFFFFF) turned
+//    into a 4 GB HeapAlloc.
+//  * ReadFile result was ignored, so a partial read produced a truncated
+//    buffer that parsed as "no fields".
 // ---------------------------------------------------------------------------
 static char *read_file_alloc(const char *path) {
-    HANDLE h = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL,
-                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    HANDLE h = INVALID_HANDLE_VALUE;
+
+    for (int attempt = 0; attempt < 4; attempt++) {
+        h = CreateFileA(path, GENERIC_READ,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                        NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (h != INVALID_HANDLE_VALUE) break;
+        DWORD err = GetLastError();
+        if (err != ERROR_SHARING_VIOLATION && err != ERROR_LOCK_VIOLATION &&
+            err != ERROR_ACCESS_DENIED)
+            return NULL;
+        Sleep(120);
+    }
     if (h == INVALID_HANDLE_VALUE) return NULL;
-    DWORD size = GetFileSize(h, NULL);
-    char *buf = (char *)HeapAlloc(GetProcessHeap(), 0, size + 1);
+
+    LARGE_INTEGER size;
+    if (!GetFileSizeEx(h, &size) ||
+        size.QuadPart <= 0 || size.QuadPart > ACF_MAX_FILE_BYTES) {
+        CloseHandle(h);
+        return NULL;
+    }
+
+    DWORD total = (DWORD)size.QuadPart;
+    char *buf = (char *)HeapAlloc(GetProcessHeap(), 0, total + 1);
     if (!buf) { CloseHandle(h); return NULL; }
-    DWORD read = 0;
-    ReadFile(h, buf, size, &read, NULL);
-    buf[read] = '\0';
+
+    DWORD done = 0;
+    while (done < total) {
+        DWORD chunk = 0;
+        if (!ReadFile(h, buf + done, total - done, &chunk, NULL)) {
+            HeapFree(GetProcessHeap(), 0, buf);
+            CloseHandle(h);
+            return NULL;
+        }
+        if (chunk == 0) break;              // shrunk while we were reading
+        done += chunk;
+    }
+    buf[done] = '\0';
     CloseHandle(h);
+
+    if (done == 0) { HeapFree(GetProcessHeap(), 0, buf); return NULL; }
     return buf;
 }
 
@@ -187,7 +235,58 @@ int acf_list_libraries(char roots[][MAX_PATH], int max_roots) {
 }
 
 // ---------------------------------------------------------------------------
-// Pick the library with the most free space (install target for new games)
+// Is this path a sane install target?
+//
+// Rules (same ones worker.c enforces, kept in sync on purpose):
+//  * the volume must be a real fixed disk - no USB sticks, no card readers,
+//    no network shares, no DVD drives, no RAM disks;
+//  * not the Windows drive;
+//  * at least 500 GB of total capacity.
+// out_total / out_free are filled whenever the volume could be queried at all.
+// ---------------------------------------------------------------------------
+int acf_disk_check(const char *path, ULONGLONG *out_total, ULONGLONG *out_free) {
+    if (out_total) *out_total = 0;
+    if (out_free)  *out_free  = 0;
+    if (!path || !path[0]) return ACF_DISK_UNUSABLE;
+
+    char root[MAX_PATH];
+    snprintf(root, MAX_PATH, "%s\\", path);
+
+    // GetDriveTypeA wants a root path ("D:\"), so cut the letter off when we
+    // got a full library path. UNC paths (\\server\share) are rejected below
+    // as DRIVE_REMOTE.
+    char vol[8] = {0};
+    if (path[1] == ':') {
+        vol[0] = path[0]; vol[1] = ':'; vol[2] = '\\'; vol[3] = '\0';
+    }
+
+    UINT dt = GetDriveTypeA(vol[0] ? vol : root);
+    if (dt != DRIVE_FIXED) return ACF_DISK_NOT_FIXED;
+
+    char sysdir[MAX_PATH] = {0};
+    GetWindowsDirectoryA(sysdir, MAX_PATH);
+    if (path[1] == ':' && sysdir[0] &&
+        (path[0] | 0x20) == (sysdir[0] | 0x20))
+        return ACF_DISK_SYSTEM;
+
+    ULARGE_INTEGER avail, total, total_free;
+    if (!GetDiskFreeSpaceExA(vol[0] ? vol : root, &avail, &total, &total_free))
+        return ACF_DISK_UNUSABLE;
+
+    if (out_total) *out_total = total.QuadPart;
+    if (out_free)  *out_free  = avail.QuadPart;
+
+    if (total.QuadPart < ACF_MIN_DISK_BYTES) return ACF_DISK_TOO_SMALL;
+    return ACF_DISK_OK;
+}
+
+// ---------------------------------------------------------------------------
+// Pick an install target for new games.
+//
+// worker.c owns the policy and reports the reason to the UI; this helper is
+// only the "give me something reasonable" shortcut used by tooling. It now
+// applies the very same rules so the two can never disagree and drop a game
+// onto the system SSD.
 // ---------------------------------------------------------------------------
 int acf_pick_install_library(char *out, int out_size) {
     static char roots[32][MAX_PATH];
@@ -195,21 +294,16 @@ int acf_pick_install_library(char *out, int out_size) {
     if (n <= 0) return 0;
 
     int best = -1;
-    ULARGE_INTEGER best_free;
-    best_free.QuadPart = 0;
+    ULONGLONG best_free = 0;
 
     for (int i = 0; i < n; i++) {
         if (GetFileAttributesA(roots[i]) == INVALID_FILE_ATTRIBUTES) continue;
-        char probe[MAX_PATH];
-        snprintf(probe, MAX_PATH, "%s\\", roots[i]);
-        ULARGE_INTEGER avail, total, total_free;
-        if (!GetDiskFreeSpaceExA(probe, &avail, &total, &total_free)) continue;
-        if (best < 0 || avail.QuadPart > best_free.QuadPart) {
-            best = i;
-            best_free = avail;
-        }
+        ULONGLONG total = 0, freeb = 0;
+        if (acf_disk_check(roots[i], &total, &freeb) != ACF_DISK_OK) continue;
+        if (best < 0 || freeb > best_free) { best = i; best_free = freeb; }
     }
-    if (best < 0) best = 0;
+
+    if (best < 0) return 0;      // deliberately no fallback to C:
 
     strncpy(out, roots[best], out_size - 1);
     out[out_size - 1] = '\0';
@@ -255,6 +349,13 @@ int acf_read_field(const char *acf_path, const char *field, char *out, int out_s
 
 // ---------------------------------------------------------------------------
 // Import the manifest SteamCMD wrote into the Steam client library
+//
+// This used to write straight over the live appmanifest and then delete the
+// source. Any failure in the middle (no rights, disk full, power loss) left
+// the game with no manifest at all - the Steam client then shows it as not
+// installed and a 50 GB folder becomes garbage. Now: write a temp file next
+// to the destination, flush it, swap it in atomically with MoveFileEx, and
+// only remove the source once the swap succeeded.
 // ---------------------------------------------------------------------------
 int acf_import_manifest(const char *steamcmd_path, const char *app_id,
                         const char *target_library, const char *installdir) {
@@ -303,9 +404,6 @@ int acf_import_manifest(const char *steamcmd_path, const char *app_id,
 
     if (!src[0]) return 0;
 
-    char *buf = read_file_alloc(src);
-    if (!buf) return 0;
-
     char dst_dir[MAX_PATH];
     snprintf(dst_dir, MAX_PATH, "%s\\steamapps", target_library);
     CreateDirectoryA(dst_dir, NULL);
@@ -313,42 +411,72 @@ int acf_import_manifest(const char *steamcmd_path, const char *app_id,
     char dst[MAX_PATH];
     snprintf(dst, MAX_PATH, "%s\\appmanifest_%s.acf", dst_dir, app_id);
 
-    // If source is different from destination, copy and ensure installdir is set
-    if (_stricmp(src, dst) != 0) {
-        HANDLE h = CreateFileA(dst, GENERIC_WRITE, 0, NULL,
-                               CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-        if (h == INVALID_HANDLE_VALUE) {
-            HeapFree(GetProcessHeap(), 0, buf);
-            return 0;
+    // Already exactly where it has to be: nothing to move, nothing to delete.
+    if (_stricmp(src, dst) == 0) return 1;
+
+    char *buf = read_file_alloc(src);
+    if (!buf) return 0;
+
+    char tmp_path[MAX_PATH];
+    snprintf(tmp_path, MAX_PATH, "%s\\appmanifest_%s.acf.tmp", dst_dir, app_id);
+
+    HANDLE h = CreateFileA(tmp_path, GENERIC_WRITE, 0, NULL,
+                           CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) {
+        HeapFree(GetProcessHeap(), 0, buf);
+        return 0;
+    }
+
+    int write_ok = 1;
+    char *p = buf;
+    while (*p && write_ok) {
+        char *eol = strchr(p, '\n');
+        size_t len = eol ? (size_t)(eol - p) + 1 : strlen(p);
+
+        // Rewrite installdir so the Steam client looks into the folder we
+        // actually filled. Long lines are copied verbatim instead of being
+        // truncated into the 1 KB scratch buffer.
+        int is_installdir = 0;
+        if (len < 1024) {
+            char probe_line[1024];
+            memcpy(probe_line, p, len);
+            probe_line[len] = '\0';
+            if (strstr(probe_line, "\"installdir\"")) is_installdir = 1;
         }
 
         DWORD written = 0;
-        char *p = buf;
-        while (*p) {
-            char *eol = strchr(p, '\n');
-            size_t len = eol ? (size_t)(eol - p) + 1 : strlen(p);
-
-            char tmp[1024];
-            size_t cl = len < sizeof(tmp) - 1 ? len : sizeof(tmp) - 1;
-            memcpy(tmp, p, cl);
-            tmp[cl] = '\0';
-
-            if (strstr(tmp, "\"installdir\"")) {
-                char out_line[1024];
-                snprintf(out_line, sizeof(out_line), "\t\"installdir\"\t\t\"%s\"\r\n", installdir);
-                WriteFile(h, out_line, (DWORD)strlen(out_line), &written, NULL);
-            } else {
-                WriteFile(h, p, (DWORD)len, &written, NULL);
-            }
-            p += len;
+        if (is_installdir) {
+            char out_line[MAX_PATH + 64];
+            int n = snprintf(out_line, sizeof(out_line),
+                             "\t\"installdir\"\t\t\"%s\"\r\n", installdir);
+            if (n < 0 || !WriteFile(h, out_line, (DWORD)strlen(out_line), &written, NULL) ||
+                written != strlen(out_line))
+                write_ok = 0;
+        } else {
+            if (!WriteFile(h, p, (DWORD)len, &written, NULL) || written != (DWORD)len)
+                write_ok = 0;
         }
-
-        CloseHandle(h);
-        // Clean up temporary src file
-        DeleteFileA(src);
+        p += len;
     }
 
+    if (write_ok) FlushFileBuffers(h);
+    CloseHandle(h);
     HeapFree(GetProcessHeap(), 0, buf);
+
+    if (!write_ok) {
+        DeleteFileA(tmp_path);
+        return 0;
+    }
+
+    // Atomic swap. The old manifest survives untouched if this fails.
+    if (!MoveFileExA(tmp_path, dst,
+                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        DeleteFileA(tmp_path);
+        return 0;
+    }
+
+    // Only now is it safe to drop SteamCMD's copy.
+    DeleteFileA(src);
     return 1;
 }
 
