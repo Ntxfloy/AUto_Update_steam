@@ -20,3 +20,6 @@ const F2PGame *catalog_find(const char *app_id);
 
 // 1 if the app id is a known free-to-play title.
 int catalog_is_f2p(const char *app_id);
+
+// 1 if the title is small enough (< ~4 GB) to be a sane smoke test.
+int catalog_is_small(const char *app_id);

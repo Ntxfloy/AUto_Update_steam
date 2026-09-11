@@ -2,6 +2,10 @@
 #pragma once
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+// objbase.h is needed for CoCreateGuid(). Older MinGW pulled it in through
+// windows.h, GCC 14+ does not, so the build failed with
+// "implicit declaration of function 'CoCreateGuid'".
+#include <objbase.h>
 #include "acf.h"
 
 // Progress callback: called on every parsed progress line

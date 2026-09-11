@@ -1,7 +1,9 @@
 // main.c - Steam Auto-Updater client, Win32 GUI entry point
 // Native Win32 UI: no external frameworks, single .exe
-// v4: Steam-like progress (bytes/speed/ETA/stall), single instance,
-//     sleep + shutdown guards, persistent file log, extra safety handlers
+// v5: flicker-free painting (no WS_EX_COMPOSITED, clipped children,
+//     WM_ERASEBKGND swallowed), Select all / Deselect all / Select all
+//     except PAID, Steam-like progress (bytes/speed/ETA/stall), single
+//     instance, sleep + shutdown guards, persistent file log.
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <commctrl.h>
@@ -34,6 +36,8 @@
 #define ID_QUEUE_TEXT      110
 #define ID_TITLE_TEXT      111
 #define ID_BTN_CHECK_ALL   112
+#define ID_BTN_UNCHECK_ALL 113
+#define ID_BTN_CHECK_F2P   114
 #define ID_TIMER_REFRESH   1001
 
 #define MAX_ROWS 128
@@ -84,19 +88,21 @@ typedef struct {
     int  result;      // 0 = none, 1 = ok, 2 = failed, 3 = in progress
 } GameRow;
 
-static HWND          g_hwnd           = NULL;
-static HWND          g_list           = NULL;
-static HWND          g_title_txt      = NULL;
-static HWND          g_btn_update     = NULL;
-static HWND          g_btn_update_all = NULL;
-static HWND          g_btn_refresh    = NULL;
-static HWND          g_btn_settings   = NULL;
-static HWND          g_btn_abort      = NULL;
-static HWND          g_btn_check_all  = NULL;
-static HWND          g_progress       = NULL;
-static HWND          g_status_txt     = NULL;
-static HWND          g_queue_txt      = NULL;
-static HWND          g_log_txt        = NULL;
+static HWND          g_hwnd            = NULL;
+static HWND          g_list            = NULL;
+static HWND          g_title_txt       = NULL;
+static HWND          g_btn_update      = NULL;
+static HWND          g_btn_update_all  = NULL;
+static HWND          g_btn_refresh     = NULL;
+static HWND          g_btn_settings    = NULL;
+static HWND          g_btn_abort       = NULL;
+static HWND          g_btn_check_all   = NULL;
+static HWND          g_btn_uncheck_all = NULL;
+static HWND          g_btn_check_f2p   = NULL;
+static HWND          g_progress        = NULL;
+static HWND          g_status_txt      = NULL;
+static HWND          g_queue_txt       = NULL;
+static HWND          g_log_txt         = NULL;
 
 static Config        g_cfg                 = {0};
 static char          g_cfg_path[MAX_PATH]  = {0};
@@ -144,6 +150,7 @@ static void      UpdateUIFromWorker(void);
 static void      ShowSettingsDialog(HWND parent);
 static void      AppendLog(const char *line);
 static void      SetQueueText(void);
+static void      SetControlsBusy(int busy);
 static void      DrawProgress(double pct, const char *label, int failed, int warn);
 static void      ProgressReset(void);
 static void      ProgressUpdate(WorkerState state, double raw_pct,
@@ -214,6 +221,10 @@ static WNDPROC g_btn_oldproc = NULL;
 
 static LRESULT CALLBACK BtnSubProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     switch (m) {
+    case WM_ERASEBKGND:
+        // The button paints its whole rect in WM_DRAWITEM. Letting Windows
+        // erase it first is exactly what made the UI blink.
+        return 1;
     case WM_MOUSEMOVE:
         if (!GetWindowLongPtrA(h, GWLP_USERDATA)) {
             TRACKMOUSEEVENT tme = { sizeof(tme), TME_LEAVE, h, 0 };
@@ -233,7 +244,7 @@ static LRESULT CALLBACK BtnSubProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 static HWND make_button(HWND parent, const char *text, int id,
                         int x, int y, int cx, int cy, int disabled) {
     HWND b = CreateWindowA("BUTTON", text,
-        WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | (disabled ? WS_DISABLED : 0),
+        WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | BS_OWNERDRAW | (disabled ? WS_DISABLED : 0),
         x, y, cx, cy, parent, (HMENU)(LONG_PTR)id, GetModuleHandle(NULL), NULL);
     SendMessage(b, WM_SETFONT, (WPARAM)g_font_ui, TRUE);
     WNDPROC prev = (WNDPROC)SetWindowLongPtrA(b, GWLP_WNDPROC, (LONG_PTR)BtnSubProc);
@@ -372,15 +383,20 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow) {
     wc.lpfnWndProc   = WndProc;
     wc.hInstance     = hInst;
     wc.lpszClassName = "SteamAutoUpdater";
-    wc.hbrBackground = g_br_bg;
+    // No class background brush: we paint the whole client area in WM_PAINT.
+    // Letting Windows erase with a brush first is a guaranteed flash.
+    wc.hbrBackground = NULL;
     wc.hIcon         = LoadIcon(NULL, IDI_APPLICATION);
     wc.hCursor       = LoadCursor(NULL, IDC_ARROW);
     RegisterClassA(&wc);
 
-    g_hwnd = CreateWindowExA(WS_EX_COMPOSITED, "SteamAutoUpdater",
-                              "Steam Auto-Updater v4.0 (F2P)",
-                              WS_OVERLAPPEDWINDOW,
-                              CW_USEDEFAULT, CW_USEDEFAULT, 920, 700,
+    // WS_EX_COMPOSITED (an XP-era double-buffering hack) fights with DWM on
+    // Windows 10/11 and with the ListView's own double buffering: the window
+    // repainted in a loop and the whole UI strobed. WS_CLIPCHILDREN instead.
+    g_hwnd = CreateWindowExA(WS_EX_APPWINDOW, "SteamAutoUpdater",
+                              "Steam Auto-Updater v5.0 (F2P)",
+                              WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
+                              CW_USEDEFAULT, CW_USEDEFAULT, 920, 760,
                               NULL, NULL, hInst, NULL);
     enable_dark_titlebar(g_hwnd);
     ShowWindow(g_hwnd, nShow);
@@ -404,18 +420,30 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow) {
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
 
+    // Swallow the erase pass; WM_PAINT below fills the background once.
+    case WM_ERASEBKGND:
+        return 1;
+
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(hwnd, &ps);
+        FillRect(dc, &ps.rcPaint, g_br_bg);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+
     case WM_CREATE: {
         HINSTANCE hi = GetModuleHandle(NULL);
 
         g_title_txt = CreateWindowA("STATIC", "Steam Auto-Updater",
-            WS_CHILD | WS_VISIBLE | SS_LEFT,
+            WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | SS_LEFT,
             16, 12, 400, 26, hwnd, (HMENU)ID_TITLE_TEXT, hi, NULL);
         SendMessage(g_title_txt, WM_SETFONT, (WPARAM)g_font_bold, TRUE);
 
         g_list = CreateWindowExA(0, WC_LISTVIEWA, "",
-            WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS
-            | LVS_NOSORTHEADER,
-            16, 46, 600, 260, hwnd, (HMENU)ID_LIST_GAMES, hi, NULL);
+            WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | LVS_REPORT | LVS_SINGLESEL
+            | LVS_SHOWSELALWAYS | LVS_NOSORTHEADER,
+            16, 46, 600, 300, hwnd, (HMENU)ID_LIST_GAMES, hi, NULL);
         ListView_SetExtendedListViewStyle(g_list,
             LVS_EX_CHECKBOXES | LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
         SendMessage(g_list, WM_SETFONT, (WPARAM)g_font_ui, TRUE);
@@ -435,34 +463,37 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         col.cx = 220; col.pszText = (LPSTR)"Game";    ListView_InsertColumn(g_list, 1, &col);
         col.cx = 85;  col.pszText = (LPSTR)"Size";    ListView_InsertColumn(g_list, 2, &col);
         col.cx = 90;  col.pszText = (LPSTR)"BuildID"; ListView_InsertColumn(g_list, 3, &col);
-        col.cx = 200; col.pszText = (LPSTR)"Status";  ListView_InsertColumn(g_list, 4, &col);
+        col.cx = 210; col.pszText = (LPSTR)"Status";  ListView_InsertColumn(g_list, 4, &col);
 
-        g_btn_update_all = make_button(hwnd, "Update ALL checked", ID_BTN_UPDATE_ALL, 630, 46,  240, 40, 0);
-        g_btn_update     = make_button(hwnd, "Update selected",    ID_BTN_UPDATE,     630, 94,  240, 34, 0);
-        g_btn_check_all  = make_button(hwnd, "Check / uncheck all",ID_BTN_CHECK_ALL,  630, 136, 240, 34, 0);
-        g_btn_refresh    = make_button(hwnd, "Refresh list",       ID_BTN_REFRESH,    630, 178, 240, 34, 0);
-        g_btn_settings   = make_button(hwnd, "Settings",           ID_BTN_SETTINGS,   630, 220, 240, 34, 0);
-        g_btn_abort      = make_button(hwnd, "Abort",              ID_BTN_ABORT,      630, 262, 240, 34, 1);
+        g_btn_update_all  = make_button(hwnd, "Update ALL checked",    ID_BTN_UPDATE_ALL,  630, 46,  240, 40, 0);
+        g_btn_update      = make_button(hwnd, "Update selected",       ID_BTN_UPDATE,      630, 94,  240, 32, 0);
+        g_btn_check_all   = make_button(hwnd, "Select all",            ID_BTN_CHECK_ALL,   630, 134, 240, 30, 0);
+        g_btn_uncheck_all = make_button(hwnd, "Deselect all",          ID_BTN_UNCHECK_ALL, 630, 168, 240, 30, 0);
+        g_btn_check_f2p   = make_button(hwnd, "Select all except PAID",ID_BTN_CHECK_F2P,   630, 202, 240, 30, 0);
+        g_btn_refresh     = make_button(hwnd, "Refresh list",          ID_BTN_REFRESH,     630, 242, 240, 30, 0);
+        g_btn_settings    = make_button(hwnd, "Settings",              ID_BTN_SETTINGS,    630, 276, 240, 30, 0);
+        g_btn_abort       = make_button(hwnd, "Abort",                 ID_BTN_ABORT,       630, 314, 240, 32, 1);
 
         // Our own progress bar: a static we paint ourselves, so it can be dark
         // and can show percentage, stage, bytes, speed and ETA inside the bar.
         g_progress = CreateWindowA("STATIC", "",
-            WS_CHILD | WS_VISIBLE | SS_OWNERDRAW,
-            16, 318, 854, 30, hwnd, (HMENU)ID_PROGRESS, hi, NULL);
+            WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | SS_OWNERDRAW,
+            16, 360, 854, 30, hwnd, (HMENU)ID_PROGRESS, hi, NULL);
 
         g_status_txt = CreateWindowA("STATIC", "Idle",
-            WS_CHILD | WS_VISIBLE | SS_LEFT | SS_ENDELLIPSIS,
-            16, 356, 854, 20, hwnd, (HMENU)ID_STATUS_TEXT, hi, NULL);
+            WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | SS_LEFT | SS_ENDELLIPSIS,
+            16, 398, 854, 20, hwnd, (HMENU)ID_STATUS_TEXT, hi, NULL);
         SendMessage(g_status_txt, WM_SETFONT, (WPARAM)g_font_ui, TRUE);
 
         g_queue_txt = CreateWindowA("STATIC", "Queue: empty",
-            WS_CHILD | WS_VISIBLE | SS_LEFT | SS_ENDELLIPSIS,
-            16, 378, 854, 20, hwnd, (HMENU)ID_QUEUE_TEXT, hi, NULL);
+            WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | SS_LEFT | SS_ENDELLIPSIS,
+            16, 420, 854, 20, hwnd, (HMENU)ID_QUEUE_TEXT, hi, NULL);
         SendMessage(g_queue_txt, WM_SETFONT, (WPARAM)g_font_ui, TRUE);
 
         g_log_txt = CreateWindowExA(0, "EDIT", "",
-            WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
-            16, 404, 854, 230, hwnd, (HMENU)ID_LOG_TEXT, hi, NULL);
+            WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_VSCROLL
+            | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
+            16, 446, 854, 250, hwnd, (HMENU)ID_LOG_TEXT, hi, NULL);
         SendMessage(g_log_txt, EM_SETLIMITTEXT, 262144, 0);
         SendMessage(g_log_txt, WM_SETFONT, (WPARAM)g_font_mono, TRUE);
 
@@ -661,6 +692,23 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                 "Empty queue", MB_OK | MB_ICONINFORMATION);
                     return 0;
                 }
+                // Paid titles cannot be updated by a pool account: a service
+                // account simply does not own them. Say so before wasting a
+                // lease and a login attempt on every one of them.
+                int paid = 0;
+                for (int i = 0; i < g_queue_len; i++)
+                    if (!g_rows[g_queue[i]].is_f2p) paid++;
+                if (paid > 0) {
+                    char q[360];
+                    snprintf(q, sizeof(q),
+                        "%d of the %d checked games are PAID titles.\n"
+                        "Pool accounts do not own them, so those rows will fail with "
+                        "\"No subscription\".\n\nRun anyway?",
+                        paid, g_queue_len);
+                    if (MessageBoxA(hwnd, q, "Paid games in the queue",
+                                    MB_YESNO | MB_ICONWARNING) != IDYES)
+                        return 0;
+                }
                 // Warn about mass fresh installs: that is tens of GB per PC.
                 int fresh = 0;
                 for (int i = 0; i < g_queue_len; i++)
@@ -679,11 +727,25 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             StartQueue();
         }
         else if (ctrl_id == ID_BTN_CHECK_ALL) {
-            int any_unchecked = 0;
             for (int i = 0; i < g_row_count; i++)
-                if (!ListView_GetCheckState(g_list, i)) { any_unchecked = 1; break; }
+                ListView_SetCheckState(g_list, i, TRUE);
+            AppendLog("All rows checked.");
+        }
+        else if (ctrl_id == ID_BTN_UNCHECK_ALL) {
             for (int i = 0; i < g_row_count; i++)
-                ListView_SetCheckState(g_list, i, any_unchecked ? TRUE : FALSE);
+                ListView_SetCheckState(g_list, i, FALSE);
+            AppendLog("All rows unchecked.");
+        }
+        else if (ctrl_id == ID_BTN_CHECK_F2P) {
+            int n = 0;
+            for (int i = 0; i < g_row_count; i++) {
+                int want = g_rows[i].is_f2p ? 1 : 0;
+                ListView_SetCheckState(g_list, i, want ? TRUE : FALSE);
+                n += want;
+            }
+            char b[96];
+            snprintf(b, sizeof(b), "Checked %d free-to-play rows, paid titles skipped.", n);
+            AppendLog(b);
         }
         else if (ctrl_id == ID_BTN_ABORT) {
             if (MessageBoxA(hwnd,
@@ -728,26 +790,28 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (list_w < 200) list_w = 200;
             int bx = 16 + list_w + gap;
 
-            MoveWindow(g_title_txt,      16, 12, list_w, 26, TRUE);
-            MoveWindow(g_list,           16, 46, list_w, 260, TRUE);
-            MoveWindow(g_btn_update_all, bx, 46,  right_w, 40, TRUE);
-            MoveWindow(g_btn_update,     bx, 94,  right_w, 34, TRUE);
-            MoveWindow(g_btn_check_all,  bx, 136, right_w, 34, TRUE);
-            MoveWindow(g_btn_refresh,    bx, 178, right_w, 34, TRUE);
-            MoveWindow(g_btn_settings,   bx, 220, right_w, 34, TRUE);
-            MoveWindow(g_btn_abort,      bx, 262, right_w, 34, TRUE);
-            MoveWindow(g_progress,   16, 318, w-32, 30, TRUE);
-            MoveWindow(g_status_txt, 16, 356, w-32, 20, TRUE);
-            MoveWindow(g_queue_txt,  16, 378, w-32, 20, TRUE);
-            MoveWindow(g_log_txt,    16, 404, w-32, h-420, TRUE);
+            MoveWindow(g_title_txt,       16, 12, list_w, 26, TRUE);
+            MoveWindow(g_list,            16, 46, list_w, 300, TRUE);
+            MoveWindow(g_btn_update_all,  bx, 46,  right_w, 40, TRUE);
+            MoveWindow(g_btn_update,      bx, 94,  right_w, 32, TRUE);
+            MoveWindow(g_btn_check_all,   bx, 134, right_w, 30, TRUE);
+            MoveWindow(g_btn_uncheck_all, bx, 168, right_w, 30, TRUE);
+            MoveWindow(g_btn_check_f2p,   bx, 202, right_w, 30, TRUE);
+            MoveWindow(g_btn_refresh,     bx, 242, right_w, 30, TRUE);
+            MoveWindow(g_btn_settings,    bx, 276, right_w, 30, TRUE);
+            MoveWindow(g_btn_abort,       bx, 314, right_w, 32, TRUE);
+            MoveWindow(g_progress,   16, 360, w-32, 30, TRUE);
+            MoveWindow(g_status_txt, 16, 398, w-32, 20, TRUE);
+            MoveWindow(g_queue_txt,  16, 420, w-32, 20, TRUE);
+            MoveWindow(g_log_txt,    16, 446, w-32, h > 480 ? h-462 : 40, TRUE);
         }
         break;
     }
 
     case WM_GETMINMAXINFO: {
         MINMAXINFO *mmi = (MINMAXINFO *)lp;
-        mmi->ptMinTrackSize.x = 800;
-        mmi->ptMinTrackSize.y = 600;
+        mmi->ptMinTrackSize.x = 820;
+        mmi->ptMinTrackSize.y = 660;
         break;
     }
 
@@ -785,14 +849,25 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 // Progress engine
 // ---------------------------------------------------------------------------
 static void DrawProgress(double pct, const char *label, int failed, int warn) {
+    // Repaint only when something visibly changed: a 100 ms timer that
+    // invalidates the bar unconditionally is its own source of flicker.
+    char newlabel[192];
+    if (label && label[0])
+        snprintf(newlabel, sizeof(newlabel), "%.1f%%   -   %s", pct, label);
+    else
+        snprintf(newlabel, sizeof(newlabel), "%.1f%%", pct);
+
+    int changed = (failed != g_pct_failed) || (warn != g_pct_warn) ||
+                  (strcmp(newlabel, g_pct_label) != 0) ||
+                  ((int)(pct * 10) != (int)(g_pct * 10));
+
     g_pct        = pct;
     g_pct_failed = failed;
     g_pct_warn   = warn;
-    if (label && label[0])
-        snprintf(g_pct_label, sizeof(g_pct_label), "%.1f%%   -   %s", pct, label);
-    else
-        snprintf(g_pct_label, sizeof(g_pct_label), "%.1f%%", pct);
-    if (g_progress) InvalidateRect(g_progress, NULL, FALSE);
+    strncpy(g_pct_label, newlabel, sizeof(g_pct_label) - 1);
+    g_pct_label[sizeof(g_pct_label) - 1] = '\0';
+
+    if (changed && g_progress) InvalidateRect(g_progress, NULL, FALSE);
 }
 
 static void ProgressReset(void) {
@@ -844,7 +919,13 @@ static void ProgressUpdate(WorkerState state, double raw_pct,
         while (par) {
             unsigned long long a = 0, b = 0;
             if (sscanf(par, "(%llu / %llu)", &a, &b) == 2 && b > 0) {
+                // A new app or a new stage can shrink the totals; never let the
+                // byte counter run backwards inside one job.
                 if (a != g_bytes_done) g_tick_bytes = now;
+                if (b < g_bytes_total && a < g_bytes_done) {
+                    g_bytes_sample = 0;
+                    g_speed_bps    = 0.0;
+                }
                 g_bytes_done  = a;
                 g_bytes_total = b;
                 break;
@@ -853,8 +934,8 @@ static void ProgressUpdate(WorkerState state, double raw_pct,
         }
     }
 
-    // Smoothed speed: EMA over ~2 second samples, so the number does not jitter
-    // between 3 MB/s and 90 MB/s twice a second like a 2000s-era downloader.
+    // Smoothed speed: EMA over ~1.5 second samples, so the number does not
+    // jitter between 3 MB/s and 90 MB/s twice a second.
     if (now - g_tick_sample >= 1500) {
         double dt = (double)(now - g_tick_sample) / 1000.0;
         if (g_bytes_done >= g_bytes_sample && dt > 0.0) {
@@ -929,7 +1010,12 @@ static void RefreshGameList(void) {
         strncpy(r->appid, cat[i].appid, sizeof(r->appid)-1);
         strncpy(r->name,  cat[i].name,  sizeof(r->name)-1);
         r->is_f2p = 1;
-        strncpy(r->status, "Not installed", sizeof(r->status)-1);
+        // Small titles are flagged so there is an obvious candidate for a
+        // first end-to-end test instead of a 60 GB download.
+        if (catalog_is_small(cat[i].appid))
+            strncpy(r->status, "Not installed (small)", sizeof(r->status)-1);
+        else
+            strncpy(r->status, "Not installed", sizeof(r->status)-1);
         strncpy(r->size,   "-",            sizeof(r->size)-1);
 
         for (int j = 0; j < n_inst; j++) {
@@ -975,12 +1061,13 @@ static void RefreshGameList(void) {
         ListView_SetItemText(g_list, i, 2, g_rows[i].size);
         ListView_SetItemText(g_list, i, 3, g_rows[i].buildid);
         ListView_SetItemText(g_list, i, 4, g_rows[i].status);
-        // Pre-check everything that is already installed; unchecked F2P rows
-        // can be ticked manually to install them from scratch.
-        ListView_SetCheckState(g_list, i, g_rows[i].installed ? TRUE : FALSE);
+        // Default selection = installed free-to-play games. Paid rows stay
+        // unchecked: a pool account cannot update them anyway.
+        ListView_SetCheckState(g_list, i,
+            (g_rows[i].installed && g_rows[i].is_f2p) ? TRUE : FALSE);
     }
     SendMessage(g_list, WM_SETREDRAW, TRUE, 0);
-    InvalidateRect(g_list, NULL, TRUE);
+    InvalidateRect(g_list, NULL, FALSE);
 
     char buf[160];
     snprintf(buf, sizeof(buf), "List refreshed: %d rows (%d installed on this PC).",
@@ -1026,7 +1113,21 @@ static void SetQueueText(void) {
                  "Queue: %d / %d   |   OK: %d   Failed: %d   |   current game: %s",
                  cur, g_queue_len, g_ok_count, g_fail_count, el);
     }
-    SetWindowTextA(g_queue_txt, buf);
+    // Rewriting identical text 10 times per second makes the label flash.
+    char old[256] = {0};
+    GetWindowTextA(g_queue_txt, old, sizeof(old) - 1);
+    if (strcmp(old, buf) != 0) SetWindowTextA(g_queue_txt, buf);
+}
+
+// Enable / disable everything that must not be touched mid-run.
+static void SetControlsBusy(int busy) {
+    EnableWindow(g_btn_update,      busy ? FALSE : TRUE);
+    EnableWindow(g_btn_update_all,  busy ? FALSE : TRUE);
+    EnableWindow(g_btn_refresh,     busy ? FALSE : TRUE);
+    EnableWindow(g_btn_check_all,   busy ? FALSE : TRUE);
+    EnableWindow(g_btn_uncheck_all, busy ? FALSE : TRUE);
+    EnableWindow(g_btn_check_f2p,   busy ? FALSE : TRUE);
+    EnableWindow(g_btn_abort,       busy ? TRUE  : FALSE);
 }
 
 static int StartRow(int row_idx) {
@@ -1088,11 +1189,7 @@ static void StartQueue(void) {
         g_worker = NULL;
     }
 
-    EnableWindow(g_btn_update, FALSE);
-    EnableWindow(g_btn_update_all, FALSE);
-    EnableWindow(g_btn_refresh, FALSE);
-    EnableWindow(g_btn_check_all, FALSE);
-    EnableWindow(g_btn_abort, TRUE);
+    SetControlsBusy(1);
     keep_awake(1);
 
     g_queue_pos = 0;
@@ -1104,11 +1201,7 @@ static void StartQueue(void) {
         if (StartRow(row)) break;
     }
     if (!g_worker) {
-        EnableWindow(g_btn_update, TRUE);
-        EnableWindow(g_btn_update_all, TRUE);
-        EnableWindow(g_btn_refresh, TRUE);
-        EnableWindow(g_btn_check_all, TRUE);
-        EnableWindow(g_btn_abort, FALSE);
+        SetControlsBusy(0);
         keep_awake(0);
     }
     SetQueueText();
@@ -1151,7 +1244,9 @@ static void UpdateUIFromWorker(void) {
         fmt_secs((double)((GetTickCount64() - g_tick_job_start) / 1000), el, sizeof(el));
         snprintf(status_buf, sizeof(status_buf), "%s  -  %s  -  running for %s%s",
                  game, state_name(state), el, g_aborting ? "  (aborting)" : "");
-        SetWindowTextA(g_status_txt, status_buf);
+        char old_status[380] = {0};
+        GetWindowTextA(g_status_txt, old_status, sizeof(old_status) - 1);
+        if (strcmp(old_status, status_buf) != 0) SetWindowTextA(g_status_txt, status_buf);
         SetQueueText();
         return;
     }
@@ -1201,11 +1296,7 @@ static void UpdateUIFromWorker(void) {
 
     // Queue finished
     g_current_row = -1;
-    EnableWindow(g_btn_update, TRUE);
-    EnableWindow(g_btn_update_all, TRUE);
-    EnableWindow(g_btn_refresh, TRUE);
-    EnableWindow(g_btn_check_all, TRUE);
-    EnableWindow(g_btn_abort, FALSE);
+    SetControlsBusy(0);
     keep_awake(0);
 
     char summary[256];
@@ -1285,7 +1376,7 @@ static void AppendLog(const char *line) {
 #define ID_BTN_BROWSE  206
 
 static HWND make_label(HWND parent, const char *text, int x, int y, int cx) {
-    HWND h = CreateWindowA("STATIC", text, WS_CHILD | WS_VISIBLE,
+    HWND h = CreateWindowA("STATIC", text, WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS,
                            x, y, cx, 20, parent, NULL, GetModuleHandle(NULL), NULL);
     SendMessage(h, WM_SETFONT, (WPARAM)g_font_ui, TRUE);
     return h;
@@ -1293,7 +1384,7 @@ static HWND make_label(HWND parent, const char *text, int x, int y, int cx) {
 
 static HWND make_edit(HWND parent, const char *text, int id, int x, int y, int cx, DWORD extra) {
     HWND h = CreateWindowExA(0, "EDIT", text,
-                             WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | extra,
+                             WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | ES_AUTOHSCROLL | extra,
                              x, y, cx, 24, parent, (HMENU)(LONG_PTR)id,
                              GetModuleHandle(NULL), NULL);
     SendMessage(h, WM_SETFONT, (WPARAM)g_font_ui, TRUE);
@@ -1302,6 +1393,17 @@ static HWND make_edit(HWND parent, const char *text, int id, int x, int y, int c
 
 LRESULT CALLBACK SettingsDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
+    case WM_ERASEBKGND:
+        return 1;
+
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(hwnd, &ps);
+        FillRect(dc, &ps.rcPaint, g_br_bg);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+
     case WM_CREATE: {
         Config *cfg = (Config *)((CREATESTRUCTA*)lp)->lpCreateParams;
         enable_dark_titlebar(hwnd);
@@ -1417,14 +1519,14 @@ static void ShowSettingsDialog(HWND parent) {
         wc.lpfnWndProc   = SettingsDlgProc;
         wc.hInstance     = GetModuleHandle(NULL);
         wc.lpszClassName = "SettingsDlg";
-        wc.hbrBackground = g_br_bg;
+        wc.hbrBackground = NULL;
         wc.hCursor       = LoadCursor(NULL, IDC_ARROW);
         RegisterClassA(&wc);
         registered = 1;
     }
 
     CreateWindowExA(WS_EX_DLGMODALFRAME, "SettingsDlg", "Settings",
-                    WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
+                    WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE | WS_CLIPCHILDREN,
                     CW_USEDEFAULT, CW_USEDEFAULT, 425, 300,
                     parent, NULL, GetModuleHandle(NULL), &g_cfg);
 }
