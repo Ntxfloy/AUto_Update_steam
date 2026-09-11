@@ -1,6 +1,9 @@
 // worker.c - Background update worker thread implementation
-// v7: build-id pre-check (skip games that are already current), validate only
-//     when it is actually needed, verbose logging of every step.
+// v8: validate is no longer triggered by an interrupted download (that is what
+//     caused PUBG to re-download 49 GB after the heartbeat dropped), install
+//     target policy is drive-type aware, the resolved install path is checked
+//     against the library the game really lives in, and the heartbeat retries
+//     instead of giving up on the first lost packet.
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <stdio.h>
@@ -16,6 +19,7 @@
 
 // Never install on a disk smaller than this (bytes). Small system SSDs in the
 // club must stay free; only manual, deliberate installs live there.
+// The real check lives in acf_disk_check() so that every code path agrees.
 #define MIN_INSTALL_DISK_BYTES  (500ULL * 1000ULL * 1000ULL * 1000ULL)
 
 // How many different pool accounts to try before giving up on one game.
@@ -25,9 +29,18 @@
 // flip it to status='bad'), give it a few chances before bailing out.
 #define MAX_DUPLICATE_HANDOUTS 4
 
-// StateFlags 4 = "fully installed". Anything else means the previous install
-// was interrupted, and only then is a validate pass worth its disk I/O.
-#define ACF_STATE_FULLY_INSTALLED 4
+// Heartbeat: every 15 s, but a single lost packet must not scare anybody.
+// The club uplink is saturated by SteamCMD while we run, so a POST can easily
+// time out; the server now keeps the lease for 240 s, which is 16 beats.
+#define HB_PERIOD_SEC        15
+#define HB_TRIES_PER_BEAT     3
+#define HB_RETRY_DELAY_MS  2000
+#define HB_WARN_AFTER         3   // consecutive failed beats before we shout
+
+// Titles above this size are shipped as a few huge monolithic archives; when
+// the publisher repacks them, even the Steam client re-downloads nearly
+// everything. Warn instead of letting the operator think we are broken.
+#define HUGE_TITLE_BYTES  (20ULL * 1000ULL * 1000ULL * 1000ULL)
 
 static volatile int  g_abort_requested = 0;   // stops heartbeat thread
 static volatile int  g_user_abort      = 0;   // user pressed Abort
@@ -89,27 +102,72 @@ static void set_error(const char *msg) {
 static void on_progress(double pct, const char *desc, void *ud) { (void)ud; set_progress(pct, desc); }
 static void on_log(const char *line, void *ud)                  { (void)ud; set_log(line); }
 
+static const char *disk_reject_reason(int code) {
+    switch (code) {
+        case ACF_DISK_SYSTEM:    return "Windows drive";
+        case ACF_DISK_TOO_SMALL: return "disk under 500 GB";
+        case ACF_DISK_NOT_FIXED: return "not a fixed disk (USB / network / optical)";
+        case ACF_DISK_UNUSABLE:  return "volume could not be queried";
+        default:                 return "eligible";
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Heartbeat thread: /accounts/heartbeat every 15s.
+//
+// A single failed POST used to produce a scary WARN line and nothing else;
+// with a saturated uplink that happened constantly. Now every beat is retried
+// up to three times, and we only complain once several beats in a row are
+// lost - which is the case that really threatens the lease.
 // ---------------------------------------------------------------------------
 typedef struct { char lease_token[64]; char pc_id[64]; } HbArgs;
 
 static DWORD WINAPI heartbeat_thread(LPVOID arg) {
     HbArgs *a = (HbArgs *)arg;
-    int beats = 0;
+    int beats = 0, ok_beats = 0, fails_in_row = 0, warned = 0;
+
     while (!g_abort_requested) {
-        for (int i = 0; i < 15 && !g_abort_requested; i++) Sleep(1000);
+        for (int i = 0; i < HB_PERIOD_SEC && !g_abort_requested; i++) Sleep(1000);
         if (g_abort_requested) break;
+
         EnterCriticalSection(&g_status->lock);
         WorkerState st = g_status->state;
         LeaveCriticalSection(&g_status->lock);
         if (st != WORKER_RUNNING) break;
-        int ok = api_heartbeat(a->lease_token, a->pc_id);
+
         beats++;
-        if (!ok) LOG_WARN("api", "heartbeat #%d failed (server unreachable?)", beats);
-        else     LOG_DEBUG("api", "heartbeat #%d ok", beats);
+        int ok = 0;
+        for (int t = 0; t < HB_TRIES_PER_BEAT && !ok && !g_abort_requested; t++) {
+            if (t) {
+                LOG_DEBUG("api", "heartbeat #%d retry %d/%d", beats, t + 1, HB_TRIES_PER_BEAT);
+                Sleep(HB_RETRY_DELAY_MS);
+            }
+            ok = api_heartbeat(a->lease_token, a->pc_id);
+        }
+
+        if (ok) {
+            ok_beats++;
+            if (fails_in_row >= HB_WARN_AFTER)
+                LOG_INFO("api", "heartbeat recovered after %d lost beat(s)", fails_in_row);
+            fails_in_row = 0;
+            warned = 0;
+            LOG_DEBUG("api", "heartbeat #%d ok", beats);
+        } else {
+            fails_in_row++;
+            if (fails_in_row >= HB_WARN_AFTER && !warned) {
+                warned = 1;
+                LOG_WARN("api",
+                         "heartbeat lost %d beats in a row (~%d s). Server down, wrong "
+                         "server_url in updater.ini or the uplink is saturated. The lease "
+                         "is reclaimed after 240 s of silence.",
+                         fails_in_row, fails_in_row * HB_PERIOD_SEC);
+            } else {
+                LOG_DEBUG("api", "heartbeat #%d failed (%d in a row)", beats, fails_in_row);
+            }
+        }
     }
-    LOG_DEBUG("api", "heartbeat thread stopped after %d beat(s)", beats);
+
+    LOG_DEBUG("api", "heartbeat thread stopped: %d beat(s), %d ok", beats, ok_beats);
     HeapFree(GetProcessHeap(), 0, a);
     return 0;
 }
@@ -152,9 +210,20 @@ static void get_lease_path(char *out, int out_size) {
 static void ensure_dir(const char *path) { CreateDirectoryA(path, NULL); }
 
 // ---------------------------------------------------------------------------
-// Install-target policy
+// Install-target policy for games that are NOT installed yet.
+//
+// Rules, in order:
+//   1. real fixed disk only - USB sticks, card readers, DVDs, network shares
+//      and RAM disks are skipped even if they are listed as a Steam library;
+//   2. never the Windows drive;
+//   3. total capacity >= 500 GB;
+//   4. among the survivors: the one with the most free space, and it must
+//      actually fit the title (when the size is known).
+// If nothing qualifies we fail loudly with the list of rejected volumes
+// instead of quietly dropping 50 GB onto C:.
 // ---------------------------------------------------------------------------
-static int pick_install_library(char *out, int out_size, char *reason, int reason_size) {
+static int pick_install_library(char *out, int out_size, char *reason, int reason_size,
+                                ULONGLONG needed_bytes) {
     static char roots[32][MAX_PATH];
     int n = acf_list_libraries(roots, 32);
     LOG_INFO("worker", "found %d Steam library folder(s)", n);
@@ -164,13 +233,9 @@ static int pick_install_library(char *out, int out_size, char *reason, int reaso
         return 0;
     }
 
-    char sysdir[MAX_PATH] = {0};
-    GetWindowsDirectoryA(sysdir, MAX_PATH);
-    char sys_letter = sysdir[0];
-
     int    best = -1;
     ULONGLONG best_free = 0;
-    int    rejected_system = 0, rejected_small = 0;
+    int    rejected_system = 0, rejected_small = 0, rejected_media = 0, rejected_space = 0;
 
     for (int i = 0; i < n; i++) {
         if (GetFileAttributesA(roots[i]) == INVALID_FILE_ATTRIBUTES) {
@@ -178,50 +243,45 @@ static int pick_install_library(char *out, int out_size, char *reason, int reaso
             continue;
         }
 
-        if (roots[i][0] && (roots[i][1] == ':') &&
-            (roots[i][0] == sys_letter ||
-             roots[i][0] == (char)(sys_letter | 0x20) ||
-             roots[i][0] == (char)(sys_letter & ~0x20))) {
-            rejected_system++;
-            LOG_INFO("worker", "library %s skipped: system drive", roots[i]);
-            continue;
+        ULONGLONG total = 0, freeb = 0;
+        int code = acf_disk_check(roots[i], &total, &freeb);
+
+        LOG_INFO("worker", "library %s: %.0f GB total, %.0f GB free -> %s",
+                 roots[i], (double)total / 1e9, (double)freeb / 1e9,
+                 disk_reject_reason(code));
+
+        if (code == ACF_DISK_SYSTEM)    { rejected_system++; continue; }
+        if (code == ACF_DISK_TOO_SMALL) { rejected_small++;  continue; }
+        if (code == ACF_DISK_NOT_FIXED) { rejected_media++;  continue; }
+        if (code != ACF_DISK_OK)        { continue; }
+
+        // Leave a little air so we do not fill the volume to the last byte.
+        if (needed_bytes) {
+            ULONGLONG want = needed_bytes + (needed_bytes / 10) + (5ULL * 1000 * 1000 * 1000);
+            if (freeb < want) {
+                rejected_space++;
+                LOG_INFO("worker", "library %s skipped: needs %.0f GB, only %.0f GB free",
+                         roots[i], (double)want / 1e9, (double)freeb / 1e9);
+                continue;
+            }
         }
 
-        char probe[MAX_PATH];
-        snprintf(probe, MAX_PATH, "%s\\", roots[i]);
-        ULARGE_INTEGER avail, total, total_free;
-        if (!GetDiskFreeSpaceExA(probe, &avail, &total, &total_free)) {
-            LOG_WARN("worker", "cannot read free space of %s", roots[i]);
-            continue;
-        }
-
-        LOG_INFO("worker", "library %s: %.0f GB total, %.0f GB free",
-                 roots[i], (double)total.QuadPart / 1e9, (double)avail.QuadPart / 1e9);
-
-        if (total.QuadPart < MIN_INSTALL_DISK_BYTES) {
-            rejected_small++;
-            LOG_INFO("worker", "library %s skipped: disk under 500 GB", roots[i]);
-            continue;
-        }
-
-        if (best < 0 || avail.QuadPart > best_free) {
-            best = i;
-            best_free = avail.QuadPart;
-        }
+        if (best < 0 || freeb > best_free) { best = i; best_free = freeb; }
     }
 
     if (best < 0) {
         snprintf(reason, reason_size,
-                 "No eligible Steam library: %d on the system disk, %d on disks under 500 GB. "
+                 "No eligible Steam library: %d on the Windows drive, %d on disks under "
+                 "500 GB, %d on removable/network media, %d without enough free space. "
                  "Create a Steam library on a big data disk (D:/E:) first.",
-                 rejected_system, rejected_small);
+                 rejected_system, rejected_small, rejected_media, rejected_space);
         return 0;
     }
 
     strncpy(out, roots[best], out_size - 1);
     out[out_size - 1] = '\0';
     snprintf(reason, reason_size, "Install target: %s (%.0f GB free).",
-             out, (double)best_free / (1024.0 * 1024.0 * 1024.0));
+             out, (double)best_free / 1e9);
     return 1;
 }
 
@@ -242,7 +302,7 @@ static DWORD WINAPI worker_thread(LPVOID arg) {
     char installdir[256]        = {0};
     char game_path[MAX_PATH]    = {0};
     char acf_path[MAX_PATH]     = {0};
-    char reason[320]            = {0};
+    char reason[400]            = {0};
     char local_buildid[32]      = {0};
 
     log_set_app(cfg->app_id);
@@ -254,8 +314,12 @@ static DWORD WINAPI worker_thread(LPVOID arg) {
     // ---- 1. Resolve where this game lives (or should live) --------------
     installed = acf_find_game(cfg->app_id, &acf);
 
-    // Validate = read and hash every installed file. That is minutes of disk
-    // I/O per game, so it only happens when the install is actually suspect.
+    // Validate = read and hash every installed file, and every chunk that does
+    // not match is re-downloaded. On titles that ship a handful of huge
+    // archives that means a near-full download, so it must stay rare:
+    // only genuinely broken installs (FilesMissing / FilesCorrupt) get it.
+    // A download that was merely interrupted (UpdateRequired / UpdateStarted /
+    // UpdateRunning / UpdatePaused) is resumed by SteamCMD chunk by chunk.
     int validate_needed = 0;
 
     if (installed) {
@@ -270,15 +334,49 @@ static DWORD WINAPI worker_thread(LPVOID arg) {
         LeaveCriticalSection(&g_status->lock);
 
         int flags = atoi(acf.state_flags);
-        LOG_INFO("worker", "installed: %s | buildid %s | stateflags %d | %.1f GB",
-                 game_path, acf.buildid, flags,
-                 atof(acf.size_on_disk) / 1e9);
+        ULONGLONG on_disk = (ULONGLONG)_atoi64(acf.size_on_disk);
 
-        if (flags != ACF_STATE_FULLY_INSTALLED) {
-            validate_needed = 1;
-            say("Previous install was interrupted (StateFlags=%d) - a file check is required.",
-                flags);
+        LOG_INFO("worker", "installed: %s | buildid %s | stateflags %d | %.1f GB",
+                 game_path, acf.buildid, flags, (double)on_disk / 1e9);
+
+        // ---- 1a. Does the resolved path really hold this game? ----------
+        // This is the guard against the old "random paths" bug: if the folder
+        // from the manifest is gone, an app_update here would silently start a
+        // full fresh download into an empty directory. Better to say so.
+        if (GetFileAttributesA(game_path) == INVALID_FILE_ATTRIBUTES) {
+            LOG_WARN("worker", "manifest points at %s but the folder does not exist",
+                     game_path);
+            say("Manifest points at a folder that no longer exists - this will be a "
+                "fresh install, not a delta update.");
         }
+
+        if (flags & (ACF_STATE_FILES_MISSING | ACF_STATE_FILES_CORRUPT)) {
+            validate_needed = 1;
+            say("Steam marked this install as damaged (StateFlags=%d) - a file check "
+                "is required, this one will take a while.", flags);
+        } else if (flags != ACF_STATE_FULLY_INSTALLED) {
+            // Exactly the PUBG case from the logs: the previous run was killed
+            // mid-download, StateFlags stayed dirty. No hashing, just resume.
+            say("Previous download was interrupted (StateFlags=%d) - resuming it "
+                "without a full file check.", flags);
+            LOG_INFO("worker", "dirty stateflags %d treated as resumable, validate skipped",
+                     flags);
+        }
+
+        if (on_disk > HUGE_TITLE_BYTES) {
+            say("Heads up: %s is %.0f GB. Publishers of titles this size repack their "
+                "archives, and then even the Steam client re-downloads almost "
+                "everything - a big download here is not necessarily a bug.",
+                acf.name[0] ? acf.name : cfg->app_id, (double)on_disk / 1e9);
+        }
+
+        // Updating in place is allowed anywhere, including C: - we only forbid
+        // NEW installs on the system disk. Still worth a log line.
+        int code = acf_disk_check(library_root, NULL, NULL);
+        if (code != ACF_DISK_OK)
+            LOG_INFO("worker", "library %s is not an eligible install target (%s), "
+                     "but the game is already there - updating in place",
+                     library_root, disk_reject_reason(code));
 
         if (!acf_backup(&acf, backup_path)) backup_path[0] = '\0';  // non-fatal
 
@@ -294,7 +392,8 @@ static DWORD WINAPI worker_thread(LPVOID arg) {
             HeapFree(GetProcessHeap(), 0, wa);
             return 1;
         }
-        if (!pick_install_library(library_root, MAX_PATH, reason, sizeof(reason))) {
+        if (!pick_install_library(library_root, MAX_PATH, reason, sizeof(reason),
+                                  (ULONGLONG)g->size_gb * 1000ULL * 1000ULL * 1000ULL)) {
             set_error(reason);
             set_state(WORKER_DONE_FAIL);
             log_set_app(NULL);
@@ -313,7 +412,8 @@ static DWORD WINAPI worker_thread(LPVOID arg) {
         ensure_dir(game_path);
 
         set_progress(0.0, "installing");
-        say("Game is not installed - performing a fresh install into %s.", game_path);
+        say("Game is not installed - performing a fresh install into %s (~%d GB).",
+            game_path, g->size_gb);
     }
 
     // ---- 2. Close the Steam client + leftover SteamCMD -------------------
@@ -323,7 +423,8 @@ static DWORD WINAPI worker_thread(LPVOID arg) {
 
     api_init(cfg->server_url, cfg->api_key);
     int f2p = catalog_is_f2p(cfg->app_id);
-    LOG_INFO("worker", "catalog: f2p=%d, server=%s", f2p, cfg->server_url);
+    LOG_INFO("worker", "catalog: f2p=%d, server=%s, validate=%d",
+             f2p, cfg->server_url, validate_needed);
 
     const char *owner = (!f2p && acf.last_owner[0] && acf.last_owner[0] != '0')
                         ? acf.last_owner : NULL;
@@ -458,6 +559,9 @@ static DWORD WINAPI worker_thread(LPVOID arg) {
             job.on_log      = on_log;
             job.job_object  = job_obj;
             job.abort_flag  = &g_user_abort;
+
+            LOG_INFO("worker", "steamcmd: install_dir=%s validate=%d f2p=%d",
+                     job.install_dir, job.validate, job.is_f2p);
 
             SecureZeroMemory(account.password, sizeof(account.password));
 
