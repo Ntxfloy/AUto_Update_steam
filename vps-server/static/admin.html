@@ -1,0 +1,446 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Steam Club — панель админа</title>
+<style>
+  :root{
+    --bg:#18181b; --panel:#202024; --panel2:#26262b; --border:#3a3a40;
+    --text:#ebebf0; --dim:#9a9aa4; --accent:#3b82f6; --accent2:#60a5fa;
+    --ok:#22c55e; --warn:#eab308; --fail:#ef4444;
+    --wrap:1200px;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);min-height:100vh;
+    overflow-x:hidden;font:14px/1.5 "Segoe UI",system-ui,sans-serif}
+  /* The bars span the full width, their contents stay in one centred column,
+     otherwise on a 2560px monitor the login box flies off to the far right. */
+  header{background:var(--panel);border-bottom:1px solid var(--border);
+    position:sticky;top:0;z-index:10;width:100%}
+  .header-inner{display:flex;align-items:center;gap:16px;padding:14px 22px;
+    max-width:var(--wrap);margin:0 auto;width:100%;flex-wrap:wrap}
+  h1{font-size:16px;margin:0;font-weight:600}
+  .spacer{flex:1}
+  .tabs-bar{background:var(--panel);border-bottom:1px solid var(--border);width:100%}
+  .tabs{display:flex;gap:4px;padding:0 22px;max-width:var(--wrap);margin:0 auto;
+    width:100%;flex-wrap:wrap}
+  .tab{padding:10px 16px;cursor:pointer;color:var(--dim);
+    border-bottom:2px solid transparent;user-select:none}
+  .tab:hover{color:var(--text)}
+  .tab.active{color:var(--text);border-bottom-color:var(--accent)}
+  main{padding:22px;max-width:var(--wrap);margin:0 auto;width:100%}
+  .page{display:none} .page.active{display:block}
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:22px}
+  .card{background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:14px 16px}
+  .card .v{font-size:26px;font-weight:600}
+  .card .l{color:var(--dim);font-size:12px;text-transform:uppercase;letter-spacing:.5px}
+  /* Wide rows scroll inside their own box instead of stretching the page. */
+  .table-wrap{width:100%;overflow-x:auto;border:1px solid var(--border);
+    border-radius:14px;background:var(--panel)}
+  table{width:100%;border-collapse:collapse;background:var(--panel);min-width:640px}
+  th{text-align:left;padding:10px 12px;background:var(--panel2);color:var(--dim);
+    font-size:12px;text-transform:uppercase;letter-spacing:.4px;font-weight:600;
+    position:sticky;top:0}
+  td{padding:9px 12px;border-top:1px solid var(--border);vertical-align:middle}
+  tr:hover td{background:#2a2a30}
+  .pill{display:inline-block;padding:2px 9px;border-radius:99px;font-size:12px;font-weight:600}
+  .s-free{background:rgba(34,197,94,.15);color:var(--ok)}
+  .s-busy{background:rgba(59,130,246,.15);color:var(--accent2)}
+  .s-bad{background:rgba(239,68,68,.15);color:var(--fail)}
+  .s-disabled{background:rgba(154,154,164,.15);color:var(--dim)}
+  button{background:var(--panel2);color:var(--text);border:1px solid var(--border);
+    border-radius:10px;padding:8px 14px;cursor:pointer;font:inherit;transition:.12s}
+  button:hover{background:#32323a;border-color:#4a4a52}
+  button.primary{background:var(--accent);border-color:var(--accent);font-weight:600}
+  button.primary:hover{background:var(--accent2);border-color:var(--accent2)}
+  button.danger:hover{background:rgba(239,68,68,.18);border-color:var(--fail);color:#fca5a5}
+  button.sm{padding:4px 9px;font-size:12px;border-radius:8px}
+  button:disabled{opacity:.45;cursor:not-allowed}
+  input,textarea,select{background:#1c1c20;color:var(--text);border:1px solid var(--border);
+    border-radius:10px;padding:9px 11px;font:inherit;width:100%;max-width:100%}
+  input:focus,textarea:focus{outline:none;border-color:var(--accent)}
+  textarea{min-height:230px;font-family:Consolas,monospace;font-size:13px;resize:vertical}
+  label{display:block;color:var(--dim);font-size:12px;margin:0 0 5px}
+  .row{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-bottom:14px}
+  pre{background:#141417;border:1px solid var(--border);border-radius:14px;padding:14px;
+    overflow:auto;max-height:65vh;font-family:Consolas,monospace;font-size:12.5px;
+    white-space:pre-wrap;word-break:break-word}
+  .hint{color:var(--dim);font-size:12.5px}
+  .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:7px}
+  .dot.on{background:var(--ok)} .dot.off{background:var(--fail)}
+  #keyBox{display:flex;gap:8px;align-items:center;max-width:420px}
+  #keyBox input{width:230px}
+  .toast{position:fixed;right:18px;bottom:18px;background:var(--panel);
+    border:1px solid var(--border);border-left:3px solid var(--accent);
+    border-radius:10px;padding:12px 16px;max-width:400px;box-shadow:0 8px 24px #0008;
+    opacity:0;transform:translateY(10px);transition:.2s;pointer-events:none}
+  .toast.show{opacity:1;transform:none}
+  .toast.err{border-left-color:var(--fail)}
+  .toast.ok{border-left-color:var(--ok)}
+  .stale{color:var(--warn)}
+  @media (max-width:760px){
+    .header-inner{padding:12px 14px}
+    .tabs{padding:0 10px}
+    main{padding:14px}
+    #keyBox{width:100%;max-width:none}
+    #keyBox input{width:100%}
+  }
+</style>
+</head>
+<body>
+<header>
+  <div class="header-inner">
+    <h1>🎮 Steam Club — панель админа</h1>
+    <span class="hint"><span id="hDot" class="dot off"></span><span id="hText">проверка…</span></span>
+    <div class="spacer"></div>
+    <div id="keyBox">
+      <input id="apiKey" type="password" placeholder="API ключ (STEAM_API_KEY)" autocomplete="off">
+      <button class="primary" onclick="saveKey()">Войти</button>
+    </div>
+  </div>
+</header>
+
+<div class="tabs-bar">
+  <div class="tabs">
+    <div class="tab active" data-p="overview">Обзор</div>
+    <div class="tab" data-p="accounts">Аккаунты</div>
+    <div class="tab" data-p="bulk">Добавить пачкой</div>
+    <div class="tab" data-p="log">Журнал обновлений</div>
+    <div class="tab" data-p="srvlog">Лог сервера</div>
+  </div>
+</div>
+
+<main>
+  <!-- ОБЗОР -->
+  <section id="p-overview" class="page active">
+    <div class="cards">
+      <div class="card"><div class="l">Всего</div><div class="v" id="cTotal">—</div></div>
+      <div class="card"><div class="l">Свободно</div><div class="v" style="color:var(--ok)" id="cFree">—</div></div>
+      <div class="card"><div class="l">В работе</div><div class="v" style="color:var(--accent2)" id="cBusy">—</div></div>
+      <div class="card"><div class="l">Битые</div><div class="v" style="color:var(--fail)" id="cBad">—</div></div>
+      <div class="card"><div class="l">За сутки ✓ / ✗</div><div class="v" id="cDay">—</div></div>
+    </div>
+    <div class="row">
+      <strong>Сейчас обновляются</strong>
+      <span class="hint">автообновление каждые 5 сек</span>
+      <div class="spacer"></div>
+      <button class="danger" onclick="forceRelease()">Снять все аренды</button>
+    </div>
+    <div class="table-wrap">
+      <table><thead><tr><th>ПК</th><th>Аккаунт</th><th>Heartbeat</th></tr></thead>
+        <tbody id="pcsBody"><tr><td colspan="3" class="hint">—</td></tr></tbody></table>
+    </div>
+  </section>
+
+  <!-- АККАУНТЫ -->
+  <section id="p-accounts" class="page">
+    <div class="row">
+      <input id="accFilter" placeholder="Фильтр по логину…" style="max-width:260px" oninput="renderAccounts()">
+      <select id="accStatus" style="max-width:170px" onchange="renderAccounts()">
+        <option value="">Все статусы</option>
+        <option value="free">free</option><option value="busy">busy</option>
+        <option value="bad">bad</option><option value="disabled">disabled</option>
+      </select>
+      <div class="spacer"></div>
+      <button onclick="reviveBad()">Вернуть все битые в пул</button>
+      <button class="primary" onclick="refresh()">Обновить</button>
+    </div>
+    <div class="table-wrap">
+      <table><thead><tr><th style="width:60px">ID</th><th>Логин</th><th style="width:110px">Статус</th>
+        <th style="width:120px">На ПК</th><th style="width:90px">F2P</th><th style="width:220px"></th></tr></thead>
+        <tbody id="accBody"></tbody></table>
+    </div>
+  </section>
+
+  <!-- ПАЧКОЙ -->
+  <section id="p-bulk" class="page">
+    <p class="hint">Одна строка — один аккаунт. Разделитель любой: <code>login:pass</code>,
+      <code>login,pass</code>, <code>login;pass</code>, табуляция или пробел.
+      Третий столбец (steam_id64) — необязателен. Пароли шифруются на сервере.</p>
+    <div class="row">
+      <input type="file" id="file" accept=".txt,.csv" style="max-width:300px" onchange="loadFile()">
+      <label style="margin:0;display:flex;align-items:center;gap:7px;color:var(--text)">
+        <input type="checkbox" id="isPaid" style="width:auto"> Отметить как платные (не F2P)</label>
+      <label style="margin:0;display:flex;align-items:center;gap:7px;color:var(--text)">
+        <input type="checkbox" id="skipDup" checked style="width:auto"> Пропускать дубликаты</label>
+    </div>
+    <textarea id="bulkText" placeholder="club_acc_01:Passw0rd123&#10;club_acc_02:Passw0rd456&#10;club_acc_03,Passw0rd789,76561199000000000"></textarea>
+    <div class="row" style="margin-top:12px">
+      <span class="hint" id="bulkCount">0 строк</span>
+      <div class="spacer"></div>
+      <button onclick="document.getElementById('bulkText').value='';countLines()">Очистить</button>
+      <button class="primary" id="bulkBtn" onclick="bulkAdd()">Загрузить в базу</button>
+    </div>
+    <pre id="bulkResult" style="display:none"></pre>
+  </section>
+
+  <!-- ЖУРНАЛ -->
+  <section id="p-log" class="page">
+    <div class="row">
+      <select id="logResult" style="max-width:190px" onchange="loadLog()">
+        <option value="">Все результаты</option>
+        <option value="success">только успешные</option>
+        <option value="error">только ошибки</option>
+      </select>
+      <input id="logPc" placeholder="Фильтр по PC-ID…" style="max-width:200px">
+      <button onclick="loadLog()">Применить</button>
+    </div>
+    <div class="table-wrap">
+      <table><thead><tr><th>ПК</th><th>AppID</th><th>Результат</th><th>Build</th>
+        <th>Ошибка</th><th>Завершено</th></tr></thead>
+        <tbody id="logBody"></tbody></table>
+    </div>
+  </section>
+
+  <!-- ЛОГ СЕРВЕРА -->
+  <section id="p-srvlog" class="page">
+    <div class="row">
+      <button class="primary" onclick="loadServerLog()">Обновить</button>
+      <label style="margin:0;display:flex;align-items:center;gap:7px;color:var(--text)">
+        <input type="checkbox" id="autoLog" style="width:auto"> Автообновление (3 с)</label>
+    </div>
+    <pre id="srvLogBox">—</pre>
+  </section>
+</main>
+
+<div id="toast" class="toast"></div>
+
+<script>
+let KEY = localStorage.getItem("steamAdminKey") || "";
+let DATA = { accounts: [], pcs: [] };
+let timer = null, logTimer = null;
+
+const TABS = ["overview", "accounts", "bulk", "log", "srvlog"];
+
+function toast(msg, kind){
+  const t = document.getElementById("toast");
+  t.textContent = msg;
+  t.className = "toast show " + (kind || "");
+  clearTimeout(t._h);
+  t._h = setTimeout(() => t.className = "toast " + (kind || ""), 4200);
+}
+
+function saveKey(){
+  KEY = document.getElementById("apiKey").value.trim();
+  localStorage.setItem("steamAdminKey", KEY);
+  refresh();
+}
+
+async function api(path, opts){
+  opts = opts || {};
+  opts.headers = Object.assign({ "Authorization": "Bearer " + KEY }, opts.headers || {});
+  if (opts.body && typeof opts.body !== "string"){
+    opts.headers["Content-Type"] = "application/json";
+    opts.body = JSON.stringify(opts.body);
+  }
+  const r = await fetch(path, opts);
+  if (r.status === 401) { setHealth(false, "неверный API ключ"); throw new Error("Неверный API ключ"); }
+  if (!r.ok){
+    let d = "HTTP " + r.status;
+    try { const j = await r.json(); if (j.detail) d = j.detail; } catch(e){}
+    throw new Error(d);
+  }
+  const ct = r.headers.get("content-type") || "";
+  return ct.includes("json") ? r.json() : r.text();
+}
+
+function setHealth(ok, text){
+  document.getElementById("hDot").className = "dot " + (ok ? "on" : "off");
+  document.getElementById("hText").textContent = text;
+}
+
+function esc(s){
+  return String(s == null ? "" : s).replace(/[&<>"']/g,
+    c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+function ago(sec){
+  if (sec == null) return "—";
+  if (sec < 60) return sec + " с назад";
+  if (sec < 3600) return Math.floor(sec/60) + " мин назад";
+  return Math.floor(sec/3600) + " ч назад";
+}
+function ts(unix){ return unix ? new Date(unix*1000).toLocaleString("ru-RU") : "—"; }
+
+async function refresh(){
+  if (!KEY){ setHealth(false, "введите API ключ"); return; }
+  try {
+    const d = await api("/admin/api/overview");
+    DATA = d;
+    setHealth(true, "сервер онлайн");
+    document.getElementById("cTotal").textContent = d.counts.total;
+    document.getElementById("cFree").textContent  = d.counts.free;
+    document.getElementById("cBusy").textContent  = d.counts.busy;
+    document.getElementById("cBad").textContent   = d.counts.bad;
+    const s = d.last_24h.success || 0, e = d.last_24h.error || 0;
+    document.getElementById("cDay").textContent = s + " / " + e;
+
+    document.getElementById("pcsBody").innerHTML = d.pcs.length
+      ? d.pcs.map(p => `<tr><td><b>${esc(p.pc_id)}</b></td><td>${esc(p.login)} <span class="hint">#${p.account_id}</span></td>
+          <td class="${p.stale ? "stale" : ""}">${ago(p.idle_sec)}${p.stale ? " ⚠ нет связи" : ""}</td></tr>`).join("")
+      : '<tr><td colspan="3" class="hint">Сейчас ничего не обновляется</td></tr>';
+    renderAccounts();
+  } catch(err){ setHealth(false, err.message); }
+}
+
+function renderAccounts(){
+  const f = (document.getElementById("accFilter").value || "").toLowerCase();
+  const st = document.getElementById("accStatus").value;
+  localStorage.setItem("steamAdminAccStatus", st);
+  const rows = DATA.accounts.filter(a =>
+    (!f || a.login.toLowerCase().includes(f)) && (!st || a.status === st));
+  document.getElementById("accBody").innerHTML = rows.length ? rows.map(a => `
+    <tr>
+      <td class="hint">${a.id}</td>
+      <td><b>${esc(a.login)}</b></td>
+      <td><span class="pill s-${esc(a.status)}">${esc(a.status)}</span></td>
+      <td>${esc(a.leased_to_pc || "—")}</td>
+      <td>${a.is_f2p ? "✓" : "—"}</td>
+      <td style="text-align:right">
+        ${a.status !== "free" ? `<button class="sm" onclick="setStatus(${a.id},'free')">В пул</button>` : ""}
+        ${a.status !== "disabled" ? `<button class="sm" onclick="setStatus(${a.id},'disabled')">Отключить</button>` : ""}
+        <button class="sm danger" onclick="delAccount(${a.id},'${esc(a.login)}')">Удалить</button>
+      </td>
+    </tr>`).join("") : '<tr><td colspan="6" class="hint">Ничего не найдено</td></tr>';
+}
+
+async function setStatus(id, status){
+  try { await api(`/admin/api/accounts/${id}/status`, { method:"POST", body:{ status } });
+    toast("Статус обновлён", "ok"); refresh(); }
+  catch(e){ toast(e.message, "err"); }
+}
+async function delAccount(id, login){
+  if (!confirm(`Удалить аккаунт ${login}?`)) return;
+  try { await api(`/admin/api/accounts/${id}`, { method:"DELETE" });
+    toast("Удалён", "ok"); refresh(); }
+  catch(e){ toast(e.message, "err"); }
+}
+async function reviveBad(){
+  try { const r = await api("/admin/api/accounts/revive-bad", { method:"POST" });
+    toast(`Возвращено в пул: ${r.revived}`, "ok"); refresh(); }
+  catch(e){ toast(e.message, "err"); }
+}
+async function forceRelease(){
+  if (!confirm("Снять все аренды? Делайте это, только если обновления точно не идут.")) return;
+  try { const r = await api("/admin/api/accounts/force-release", { method:"POST" });
+    toast(`Снято аренд: ${r.released}`, "ok"); refresh(); }
+  catch(e){ toast(e.message, "err"); }
+}
+
+function countLines(){
+  const n = document.getElementById("bulkText").value
+    .split("\n").filter(l => l.trim()).length;
+  document.getElementById("bulkCount").textContent = n + " строк";
+}
+function loadFile(){
+  const f = document.getElementById("file").files[0];
+  if (!f) return;
+  const rd = new FileReader();
+  rd.onload = () => { document.getElementById("bulkText").value = rd.result; countLines(); };
+  rd.readAsText(f, "utf-8");
+}
+async function bulkAdd(){
+  const text = document.getElementById("bulkText").value.trim();
+  if (!text) { toast("Пустой список", "err"); return; }
+  const btn = document.getElementById("bulkBtn");
+  btn.disabled = true; btn.textContent = "Загружаю…";
+  try {
+    const r = await api("/admin/api/accounts/bulk", { method:"POST", body:{
+      text, is_paid: document.getElementById("isPaid").checked,
+      skip_duplicates: document.getElementById("skipDup").checked } });
+    const box = document.getElementById("bulkResult");
+    box.style.display = "block";
+    box.textContent = `Добавлено: ${r.added}\nПропущено: ${r.skipped.length}\n`
+      + r.skipped.map(s => `  строка ${s.line}: ${s.text} — ${s.reason}`).join("\n");
+    toast(`Добавлено ${r.added}, пропущено ${r.skipped.length}`,
+      r.added ? "ok" : "err");
+    if (r.added) document.getElementById("bulkText").value = "";
+    countLines(); refresh();
+  } catch(e){ toast(e.message, "err"); }
+  finally { btn.disabled = false; btn.textContent = "Загрузить в базу"; }
+}
+
+async function loadLog(){
+  const p = new URLSearchParams({ limit: "150" });
+  const r = document.getElementById("logResult").value;
+  const pc = document.getElementById("logPc").value.trim();
+  localStorage.setItem("steamAdminLogResult", r);
+  localStorage.setItem("steamAdminLogPc", pc);
+  if (r) p.set("result", r);
+  if (pc) p.set("pc_id", pc);
+  try {
+    const rows = await api("/admin/api/log?" + p);
+    document.getElementById("logBody").innerHTML = rows.length ? rows.map(l => `
+      <tr><td><b>${esc(l.pc_id)}</b></td><td>${esc(l.app_id)}</td>
+        <td><span class="pill ${l.result === "success" ? "s-free" : "s-bad"}">${esc(l.result)}</span></td>
+        <td class="hint">${esc(l.build_id_before || "?")} → ${esc(l.build_id_after || "?")}</td>
+        <td>${esc(l.error_msg || "—")}</td><td class="hint">${ts(l.finished_at)}</td></tr>`).join("")
+      : '<tr><td colspan="6" class="hint">Записей нет</td></tr>';
+  } catch(e){ toast(e.message, "err"); }
+}
+
+async function loadServerLog(){
+  try {
+    const t = await api("/admin/api/server-log?lines=300");
+    const box = document.getElementById("srvLogBox");
+    box.textContent = t;
+    box.scrollTop = box.scrollHeight;
+  } catch(e){ toast(e.message, "err"); }
+}
+
+// --- Tabs ------------------------------------------------------------------
+// The active tab is kept in localStorage AND in the URL hash, so F5 (or a
+// restarted server) puts you back where you were instead of always throwing
+// you to the Overview page.
+function showTab(name, push){
+  if (TABS.indexOf(name) < 0) name = "overview";
+  document.querySelectorAll(".tab").forEach(x =>
+    x.classList.toggle("active", x.dataset.p === name));
+  document.querySelectorAll(".page").forEach(x => x.classList.remove("active"));
+  const page = document.getElementById("p-" + name);
+  if (page) page.classList.add("active");
+  localStorage.setItem("steamAdminTab", name);
+  if (push && location.hash !== "#" + name){
+    history.replaceState(null, "", "#" + name);
+  }
+  if (name === "log") loadLog();
+  if (name === "srvlog") loadServerLog();
+}
+
+document.querySelectorAll(".tab").forEach(t =>
+  t.onclick = () => showTab(t.dataset.p, true));
+window.addEventListener("hashchange",
+  () => showTab((location.hash || "").replace("#", ""), false));
+
+document.getElementById("bulkText").addEventListener("input", countLines);
+document.getElementById("apiKey").addEventListener("keydown",
+  e => { if (e.key === "Enter") saveKey(); });
+document.getElementById("logPc").addEventListener("keydown",
+  e => { if (e.key === "Enter") loadLog(); });
+document.getElementById("autoLog").addEventListener("change", e => {
+  clearInterval(logTimer);
+  localStorage.setItem("steamAdminAutoLog", e.target.checked ? "1" : "0");
+  if (e.target.checked) logTimer = setInterval(loadServerLog, 3000);
+});
+
+// --- Restore the previous session -----------------------------------------
+if (KEY) document.getElementById("apiKey").value = KEY;
+document.getElementById("accStatus").value =
+  localStorage.getItem("steamAdminAccStatus") || "";
+document.getElementById("logResult").value =
+  localStorage.getItem("steamAdminLogResult") || "";
+document.getElementById("logPc").value =
+  localStorage.getItem("steamAdminLogPc") || "";
+if (localStorage.getItem("steamAdminAutoLog") === "1"){
+  document.getElementById("autoLog").checked = true;
+  logTimer = setInterval(loadServerLog, 3000);
+}
+
+showTab((location.hash || "").replace("#", "") ||
+        localStorage.getItem("steamAdminTab") || "overview", true);
+
+refresh();
+timer = setInterval(() => { if (!document.hidden) refresh(); }, 5000);
+</script>
+</body>
+</html>

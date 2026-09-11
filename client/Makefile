@@ -1,52 +1,35 @@
-# Makefile for Steam Auto-Updater client
-# Compiler: MinGW-w64 (gcc) via Strawberry Perl or standalone MinGW
-# Usage:
-#   mingw32-make          - build release  -> dist/steam_updater.exe
-#   mingw32-make debug    - build with debug info
-#   mingw32-make clean    - remove build artifacts
+# Makefile for Steam Auto-Updater client (MinGW-w64)
+#   cd client && mingw32-make
+# Output: dist/steam_updater.exe
 
-CC      = gcc
-DIST_DIR = dist
-OBJ_DIR  = obj
-TARGET   = $(DIST_DIR)/steam_updater.exe
+CC       = gcc
 SRC_DIR  = src
+TARGET   = dist/steam_updater.exe
 
-SRCS = $(SRC_DIR)/main.c     \
-       $(SRC_DIR)/acf.c      \
+SRCS = $(SRC_DIR)/main.c \
+       $(SRC_DIR)/config.c \
+       $(SRC_DIR)/acf.c \
+       $(SRC_DIR)/catalog.c \
+       $(SRC_DIR)/log.c \
        $(SRC_DIR)/steamcmd.c \
-       $(SRC_DIR)/api.c      \
-       $(SRC_DIR)/worker.c   \
-       $(SRC_DIR)/config.c   \
-       $(SRC_DIR)/lease.c
-
-OBJS = $(patsubst $(SRC_DIR)/%.c, $(OBJ_DIR)/%.o, $(SRCS))
+       $(SRC_DIR)/api.c \
+       $(SRC_DIR)/lease.c \
+       $(SRC_DIR)/worker.c
 
 CFLAGS  = -Wall -Wextra -O2 -DWINVER=0x0601 -D_WIN32_WINNT=0x0601
-LDFLAGS = -mwindows -lwinhttp -lole32 -lcomctl32 -lcomdlg32
+LDFLAGS = -mwindows -lwinhttp -lole32 -lcomctl32 -lcomdlg32 -lgdi32 -luser32
 
-# Debug build
-DEBUG_CFLAGS = -Wall -Wextra -g -DDEBUG -DWINVER=0x0601 -D_WIN32_WINNT=0x0601
+all: $(TARGET)
 
-.PHONY: all debug clean
+$(TARGET): $(SRCS)
+	@if not exist dist mkdir dist
+	$(CC) $(CFLAGS) -o $(TARGET) $(SRCS) $(LDFLAGS)
 
-all: $(OBJ_DIR) $(DIST_DIR) $(TARGET)
-
-debug: CFLAGS = $(DEBUG_CFLAGS)
-debug: $(OBJ_DIR) $(DIST_DIR) $(TARGET)
-
-$(OBJ_DIR):
-	if not exist $(OBJ_DIR) mkdir $(OBJ_DIR)
-
-$(DIST_DIR):
-	if not exist $(DIST_DIR) mkdir $(DIST_DIR)
-
-$(OBJ_DIR)/%.o: $(SRC_DIR)/%.c
-	$(CC) $(CFLAGS) -c $< -o $@
-
-$(TARGET): $(OBJS)
-	$(CC) $(OBJS) -o $@ $(LDFLAGS)
-	@echo "=== Built: $(TARGET) ==="
+debug: CFLAGS += -g -O0 -DDEBUG
+debug: LDFLAGS := $(filter-out -mwindows,$(LDFLAGS))
+debug: $(TARGET)
 
 clean:
-	if exist $(OBJ_DIR) rmdir /s /q $(OBJ_DIR)
-	if exist $(DIST_DIR) rmdir /s /q $(DIST_DIR)
+	-del /q dist\steam_updater.exe
+
+.PHONY: all debug clean

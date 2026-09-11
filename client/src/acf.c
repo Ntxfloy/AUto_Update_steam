@@ -16,12 +16,10 @@ static int vdf_extract(const char *buf, const char *field, char *out, int out_si
 
     const char *p = buf;
     while ((p = strstr(p, pattern)) != NULL) {
-        // skip the field name
         p += strlen(pattern);
-        // skip whitespace/tabs
         while (*p == ' ' || *p == '\t') p++;
         if (*p != '"') { p++; continue; }
-        p++; // skip opening quote
+        p++;
         const char *start = p;
         while (*p && *p != '"') p++;
         int len = (int)(p - start);
@@ -51,6 +49,174 @@ static char *read_file_alloc(const char *path) {
 }
 
 // ---------------------------------------------------------------------------
+// Internal: path helpers
+// ---------------------------------------------------------------------------
+static void normalize_path(char *p) {
+    for (char *c = p; *c; c++) if (*c == '/') *c = '\\';
+    int n = (int)strlen(p);
+    while (n > 0 && p[n - 1] == '\\') p[--n] = '\0';
+}
+
+static int reg_read_str(HKEY root, const char *subkey, const char *value,
+                        REGSAM extra, char *out, DWORD out_size) {
+    HKEY hk;
+    if (RegOpenKeyExA(root, subkey, 0, KEY_READ | extra, &hk) != ERROR_SUCCESS) return 0;
+    DWORD sz = out_size - 1, type = 0;
+    LONG r = RegQueryValueExA(hk, value, NULL, &type, (BYTE *)out, &sz);
+    RegCloseKey(hk);
+    if (r != ERROR_SUCCESS) return 0;
+    if (type != REG_SZ && type != REG_EXPAND_SZ) return 0;
+    if (sz >= out_size) sz = out_size - 1;
+    out[sz] = '\0';
+    return out[0] != '\0';
+}
+
+// ---------------------------------------------------------------------------
+// Resolve the Steam client root
+//
+// The old code read only HKCU\Software\Valve\Steam!SteamPath and silently fell
+// back to "C:\Program Files (x86)\Steam". Under SYSTEM / Task Scheduler / a
+// different Windows user that hive is a different one and the value is empty,
+// which is exactly why paths looked "random". HKLM is machine-wide and is the
+// value to trust first.
+// ---------------------------------------------------------------------------
+int acf_get_steam_root(char *out, int out_size) {
+    char buf[MAX_PATH] = {0};
+    int ok = 0;
+
+    if (!ok) ok = reg_read_str(HKEY_LOCAL_MACHINE,
+                               "SOFTWARE\\WOW6432Node\\Valve\\Steam",
+                               "InstallPath", 0, buf, MAX_PATH);
+    if (!ok) ok = reg_read_str(HKEY_LOCAL_MACHINE, "SOFTWARE\\Valve\\Steam",
+                               "InstallPath", KEY_WOW64_32KEY, buf, MAX_PATH);
+    if (!ok) ok = reg_read_str(HKEY_LOCAL_MACHINE, "SOFTWARE\\Valve\\Steam",
+                               "InstallPath", KEY_WOW64_64KEY, buf, MAX_PATH);
+    if (!ok) ok = reg_read_str(HKEY_CURRENT_USER, "Software\\Valve\\Steam",
+                               "SteamPath", 0, buf, MAX_PATH);
+
+    if (ok) {
+        normalize_path(buf);
+        char probe[MAX_PATH];
+        snprintf(probe, MAX_PATH, "%s\\steamapps", buf);
+        if (GetFileAttributesA(probe) == INVALID_FILE_ATTRIBUTES) ok = 0;
+    }
+
+    if (!ok) {
+        static const char *cands[] = {
+            "C:\\Program Files (x86)\\Steam", "C:\\Steam", "C:\\Games\\Steam",
+            "D:\\Steam", "D:\\Program Files (x86)\\Steam", "D:\\Games\\Steam",
+            "E:\\Steam", "E:\\Games\\Steam"
+        };
+        for (int i = 0; i < (int)(sizeof(cands) / sizeof(cands[0])); i++) {
+            char probe[MAX_PATH];
+            snprintf(probe, MAX_PATH, "%s\\steamapps", cands[i]);
+            if (GetFileAttributesA(probe) != INVALID_FILE_ATTRIBUTES) {
+                strncpy(buf, cands[i], MAX_PATH - 1);
+                buf[MAX_PATH - 1] = '\0';
+                ok = 1;
+                break;
+            }
+        }
+    }
+
+    if (!ok) return 0;
+    strncpy(out, buf, out_size - 1);
+    out[out_size - 1] = '\0';
+    return 1;
+}
+
+// ---------------------------------------------------------------------------
+// List all Steam library roots
+// ---------------------------------------------------------------------------
+int acf_list_libraries(char roots[][MAX_PATH], int max_roots) {
+    if (max_roots <= 0) return 0;
+
+    char steam_root[MAX_PATH] = {0};
+    if (!acf_get_steam_root(steam_root, MAX_PATH)) return 0;
+
+    int count = 0;
+    strncpy(roots[count], steam_root, MAX_PATH - 1);
+    roots[count][MAX_PATH - 1] = '\0';
+    count++;
+
+    char vdf_paths[2][MAX_PATH];
+    snprintf(vdf_paths[0], MAX_PATH, "%s\\config\\libraryfolders.vdf", steam_root);
+    snprintf(vdf_paths[1], MAX_PATH, "%s\\steamapps\\libraryfolders.vdf", steam_root);
+
+    for (int v = 0; v < 2; v++) {
+        char *vdf = read_file_alloc(vdf_paths[v]);
+        if (!vdf) continue;
+
+        const char *p = vdf;
+        while (count < max_roots && (p = strstr(p, "\"path\"")) != NULL) {
+            p += 6;
+            while (*p == ' ' || *p == '\t') p++;
+            if (*p != '"') continue;
+            p++;
+            const char *start = p;
+            while (*p && *p != '"') p++;
+            int len = (int)(p - start);
+            if (len <= 0) continue;
+            if (len >= MAX_PATH) len = MAX_PATH - 1;
+
+            char tmp[MAX_PATH] = {0};
+            memcpy(tmp, start, len);
+
+            // "C:\\Games\\Steam" -> "C:\Games\Steam"
+            char norm[MAX_PATH] = {0};
+            int ni = 0;
+            for (int i = 0; tmp[i] && ni < MAX_PATH - 1; i++) {
+                if (tmp[i] == '\\' && tmp[i + 1] == '\\') { norm[ni++] = '\\'; i++; }
+                else                                       { norm[ni++] = tmp[i]; }
+            }
+            normalize_path(norm);
+            if (!norm[0]) continue;
+
+            int dup = 0;
+            for (int i = 0; i < count; i++)
+                if (_stricmp(roots[i], norm) == 0) { dup = 1; break; }
+            if (dup) continue;
+
+            strncpy(roots[count], norm, MAX_PATH - 1);
+            roots[count][MAX_PATH - 1] = '\0';
+            count++;
+        }
+        HeapFree(GetProcessHeap(), 0, vdf);
+    }
+    return count;
+}
+
+// ---------------------------------------------------------------------------
+// Pick the library with the most free space (install target for new games)
+// ---------------------------------------------------------------------------
+int acf_pick_install_library(char *out, int out_size) {
+    static char roots[32][MAX_PATH];
+    int n = acf_list_libraries(roots, 32);
+    if (n <= 0) return 0;
+
+    int best = -1;
+    ULARGE_INTEGER best_free;
+    best_free.QuadPart = 0;
+
+    for (int i = 0; i < n; i++) {
+        if (GetFileAttributesA(roots[i]) == INVALID_FILE_ATTRIBUTES) continue;
+        char probe[MAX_PATH];
+        snprintf(probe, MAX_PATH, "%s\\", roots[i]);
+        ULARGE_INTEGER avail, total, total_free;
+        if (!GetDiskFreeSpaceExA(probe, &avail, &total, &total_free)) continue;
+        if (best < 0 || avail.QuadPart > best_free.QuadPart) {
+            best = i;
+            best_free = avail;
+        }
+    }
+    if (best < 0) best = 0;
+
+    strncpy(out, roots[best], out_size - 1);
+    out[out_size - 1] = '\0';
+    return 1;
+}
+
+// ---------------------------------------------------------------------------
 // Parse a single .acf file
 // ---------------------------------------------------------------------------
 int acf_parse(const char *acf_path, const char *library_root, AcfInfo *out) {
@@ -69,7 +235,6 @@ int acf_parse(const char *acf_path, const char *library_root, AcfInfo *out) {
     vdf_extract(buf, "LastOwner",  out->last_owner,  sizeof(out->last_owner));
     vdf_extract(buf, "SizeOnDisk", out->size_on_disk,sizeof(out->size_on_disk));
 
-    // game_path = library_root\steamapps\common\installdir
     snprintf(out->game_path, MAX_PATH, "%s\\steamapps\\common\\%s",
              library_root, out->installdir);
 
@@ -89,82 +254,71 @@ int acf_read_field(const char *acf_path, const char *field, char *out, int out_s
 }
 
 // ---------------------------------------------------------------------------
-// Scan Steam libraries from registry + libraryfolders.vdf
+// Import the manifest SteamCMD wrote into the Steam client library
+// ---------------------------------------------------------------------------
+int acf_import_manifest(const char *steamcmd_path, const char *app_id,
+                        const char *target_library, const char *installdir) {
+    char dir[MAX_PATH];
+    strncpy(dir, steamcmd_path, MAX_PATH - 1);
+    dir[MAX_PATH - 1] = '\0';
+    char *slash = strrchr(dir, '\\');
+    if (!slash) slash = strrchr(dir, '/');
+    if (!slash) return 0;
+    *slash = '\0';
+
+    char src[MAX_PATH];
+    snprintf(src, MAX_PATH, "%s\\steamapps\\appmanifest_%s.acf", dir, app_id);
+    char *buf = read_file_alloc(src);
+    if (!buf) return 0;
+
+    char dst_dir[MAX_PATH];
+    snprintf(dst_dir, MAX_PATH, "%s\\steamapps", target_library);
+    CreateDirectoryA(dst_dir, NULL);
+
+    char dst[MAX_PATH];
+    snprintf(dst, MAX_PATH, "%s\\appmanifest_%s.acf", dst_dir, app_id);
+
+    HANDLE h = CreateFileA(dst, GENERIC_WRITE, 0, NULL,
+                           CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) {
+        HeapFree(GetProcessHeap(), 0, buf);
+        return 0;
+    }
+
+    DWORD written = 0;
+    char *p = buf;
+    while (*p) {
+        char *eol = strchr(p, '\n');
+        size_t len = eol ? (size_t)(eol - p) + 1 : strlen(p);
+
+        char tmp[1024];
+        size_t cl = len < sizeof(tmp) - 1 ? len : sizeof(tmp) - 1;
+        memcpy(tmp, p, cl);
+        tmp[cl] = '\0';
+
+        if (strstr(tmp, "\"installdir\"")) {
+            char out_line[1024];
+            snprintf(out_line, sizeof(out_line), "\t\"installdir\"\t\t\"%s\"\r\n", installdir);
+            WriteFile(h, out_line, (DWORD)strlen(out_line), &written, NULL);
+        } else {
+            WriteFile(h, p, (DWORD)len, &written, NULL);
+        }
+        p += len;
+    }
+
+    CloseHandle(h);
+    HeapFree(GetProcessHeap(), 0, buf);
+    return 1;
+}
+
+// ---------------------------------------------------------------------------
+// Scan Steam libraries for appmanifest_*.acf
 // ---------------------------------------------------------------------------
 int acf_scan_libraries(AcfInfo *out, int max_out) {
-    // 1. Get Steam root from registry
-    char steam_root[MAX_PATH] = {0};
-    HKEY hk;
-    if (RegOpenKeyExA(HKEY_CURRENT_USER, "Software\\Valve\\Steam",
-                      0, KEY_READ, &hk) == ERROR_SUCCESS) {
-        DWORD sz = MAX_PATH;
-        RegQueryValueExA(hk, "SteamPath", NULL, NULL, (BYTE*)steam_root, &sz);
-        RegCloseKey(hk);
-    }
-    // Normalize slashes
-    for (char *c = steam_root; *c; c++) if (*c == '/') *c = '\\';
-    // Trim trailing slash
-    int rlen = (int)strlen(steam_root);
-    while (rlen > 0 && steam_root[rlen-1] == '\\') steam_root[--rlen] = '\0';
+    static char lib_roots[32][MAX_PATH];
+    int lib_count = acf_list_libraries(lib_roots, 32);
+    if (lib_count <= 0) return 0;
 
-    if (!steam_root[0]) {
-        // Fallback
-        strncpy(steam_root, "C:\\Program Files (x86)\\Steam", MAX_PATH-1);
-    }
-
-    // 2. Build list of library roots
-    char lib_roots[32][MAX_PATH];
-    int  lib_count = 0;
-    strncpy(lib_roots[lib_count++], steam_root, MAX_PATH-1);
-
-    // Parse libraryfolders.vdf
-    char vdf_paths[2][MAX_PATH];
-    snprintf(vdf_paths[0], MAX_PATH, "%s\\config\\libraryfolders.vdf", steam_root);
-    snprintf(vdf_paths[1], MAX_PATH, "%s\\steamapps\\libraryfolders.vdf", steam_root);
-
-    for (int v = 0; v < 2; v++) {
-        char *vdf = read_file_alloc(vdf_paths[v]);
-        if (!vdf) continue;
-
-        const char *p = vdf;
-        while ((p = strstr(p, "\"path\"")) != NULL) {
-            p += 6;
-            while (*p == ' ' || *p == '\t') p++;
-            if (*p != '"') continue;
-            p++;
-            const char *start = p;
-            while (*p && *p != '"') p++;
-            int len = (int)(p - start);
-            if (len > 0 && lib_count < 32) {
-                char tmp[MAX_PATH] = {0};
-                if (len >= MAX_PATH) len = MAX_PATH - 1;
-                memcpy(tmp, start, len);
-                tmp[len] = '\0';
-                // Normalize: replace double backslashes with single backslash
-                char normalized[MAX_PATH] = {0};
-                int ni = 0;
-                for (int i = 0; tmp[i] && ni < MAX_PATH-1; i++) {
-                    if (tmp[i] == '\\' && tmp[i+1] == '\\') {
-                        normalized[ni++] = '\\';
-                        i++; // skip second backslash
-                    } else {
-                        normalized[ni++] = tmp[i];
-                    }
-                }
-                // Check for duplicates
-                int dup = 0;
-                for (int i = 0; i < lib_count; i++) {
-                    if (_stricmp(lib_roots[i], normalized) == 0) { dup = 1; break; }
-                }
-                if (!dup && normalized[0]) {
-                    strncpy(lib_roots[lib_count++], normalized, MAX_PATH-1);
-                }
-            }
-        }
-        HeapFree(GetProcessHeap(), 0, vdf);
-    }
-
-    // 3. Scan each library for appmanifest_*.acf
     int found = 0;
     for (int li = 0; li < lib_count && found < max_out; li++) {
         char pattern[MAX_PATH];
@@ -179,7 +333,10 @@ int acf_scan_libraries(AcfInfo *out, int max_out) {
             snprintf(acf_full, MAX_PATH, "%s\\steamapps\\%s",
                      lib_roots[li], fd.cFileName);
             if (acf_parse(acf_full, lib_roots[li], &out[found])) {
-                found++;
+                // Only report games whose content folder really exists on disk.
+                if (GetFileAttributesA(out[found].game_path) != INVALID_FILE_ATTRIBUTES) {
+                    found++;
+                }
             }
         } while (FindNextFileA(hf, &fd) && found < max_out);
         FindClose(hf);
@@ -191,7 +348,7 @@ int acf_scan_libraries(AcfInfo *out, int max_out) {
 // Find one game by app_id
 // ---------------------------------------------------------------------------
 int acf_find_game(const char *app_id, AcfInfo *out) {
-    AcfInfo all[256];
+    static AcfInfo all[256];
     int n = acf_scan_libraries(all, 256);
     for (int i = 0; i < n; i++) {
         if (strcmp(all[i].appid, app_id) == 0) {
@@ -209,7 +366,6 @@ int acf_backup(const AcfInfo *info, char *backup_path) {
     char tmp_dir[MAX_PATH];
     GetTempPathA(MAX_PATH, tmp_dir);
 
-    // timestamp
     SYSTEMTIME st;
     GetLocalTime(&st);
     snprintf(backup_path, MAX_PATH,

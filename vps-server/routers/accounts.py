@@ -4,6 +4,7 @@ routers/accounts.py — эндпоинты /accounts/*
 from __future__ import annotations
 
 import logging
+import sqlite3
 from typing import Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -15,6 +16,17 @@ from routers.deps import verify_api_key
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/accounts")
+
+# Клиент присылает человекочитаемый error_msg из steamcmd_result_name().
+# Эти ошибки означают, что аккаунт непригоден (неверный пароль, включён
+# Steam Guard, бан, ограниченный аккаунт) — его нельзя выдавать следующему ПК,
+# иначе весь клуб будет по очереди спотыкаться об одну и ту же битую запись.
+BAD_ACCOUNT_MARKERS = (
+    "authentication failure",
+    "no license",
+    "login failure",
+    "steam guard",
+)
 
 
 def get_enc_key() -> bytes:
@@ -45,6 +57,13 @@ class ReleaseRequest(BaseModel):
 
 
 # --- Helpers ---
+
+def _is_bad_account_error(error_msg: Optional[str]) -> bool:
+    if not error_msg:
+        return False
+    low = error_msg.lower()
+    return any(m in low for m in BAD_ACCOUNT_MARKERS)
+
 
 def _acquire_one(conn: sqlite3.Connection, body: AcquireRequest) -> Optional[sqlite3.Row]:
     """Атомарный захват свободного аккаунта с retry на race condition."""
@@ -90,6 +109,11 @@ def _replay_idempotent(conn: sqlite3.Connection, body: AcquireRequest) -> dict:
         "FROM idempotency_keys WHERE key=? AND pc_id=?",
         (body.idempotency_key, body.pc_id)
     ).fetchone()
+
+    # Запись мог удалить сборщик мусора (>24ч) между INSERT OR IGNORE и чтением.
+    # Без этой проверки здесь был TypeError → 500 вместо внятного ответа.
+    if rec is None:
+        raise HTTPException(status_code=409, detail="Ключ идемпотентности не найден, повторите запрос")
 
     if rec["status"] == "in_progress":
         raise HTTPException(
@@ -218,14 +242,19 @@ def heartbeat(body: HeartbeatRequest):
 def release_account(body: ReleaseRequest):
     conn: sqlite3.Connection = get_conn()
     try:
-        # C2: освобождаем ТОЛЬКО свою аренду (lease_token И leased_to_pc)
+        bad_credentials = (body.result == "failed" and _is_bad_account_error(body.error_msg))
+
+        # Освобождаем ТОЛЬКО свою аренду (lease_token И leased_to_pc).
+        # Если аккаунт не пустил — он не возвращается в пул, а помечается 'bad',
+        # чтобы следующий acquire выдал другой логин.
+        new_status = "bad" if bad_credentials else "free"
         row = conn.execute(
-            "UPDATE accounts SET status='free', lease_token=NULL, leased_to_pc=NULL "
+            "UPDATE accounts SET status=?, lease_token=NULL, leased_to_pc=NULL "
             "WHERE lease_token=? AND leased_to_pc=? RETURNING id",
-            (body.lease_token, body.pc_id)
+            (new_status, body.lease_token, body.pc_id)
         ).fetchone()
 
-        # Если аренда уже истекла (cleanup) — пробуем найти account_id по idempotency_keys
+        # Если аренда уже истекла (cleanup) — ищем account_id по idempotency_keys
         if row:
             account_id = row["id"]
         else:
@@ -236,6 +265,20 @@ def release_account(body: ReleaseRequest):
             ).fetchone()
             account_id = idem["account_id"] if idem else None
 
+            # Аренда истекла, но аккаунт всё равно битый — помечаем его,
+            # но только если его уже не забрал другой ПК.
+            if bad_credentials and account_id is not None:
+                conn.execute(
+                    "UPDATE accounts SET status='bad' WHERE id=? AND status='free'",
+                    (account_id,)
+                )
+
+        if bad_credentials and account_id is not None:
+            logger.warning(
+                "Аккаунт id=%s помечен 'bad' (pc_id=%s): %s",
+                account_id, body.pc_id, body.error_msg
+            )
+
         started_at = None
         if account_id is not None:
             idem = conn.execute(
@@ -245,7 +288,7 @@ def release_account(body: ReleaseRequest):
             ).fetchone()
             started_at = idem["created_at"] if idem else None
 
-        # C3: лог пишем ВСЕГДА, даже если аренда уже истекла
+        # Лог пишем ВСЕГДА, даже если аренда уже истекла
         if started_at is not None:
             conn.execute(
                 "INSERT INTO update_log "
@@ -264,7 +307,7 @@ def release_account(body: ReleaseRequest):
             )
 
         conn.commit()
-        return {"ok": True, "released": bool(row)}
+        return {"ok": True, "released": bool(row), "account_disabled": bad_credentials}
     finally:
         conn.close()
 
