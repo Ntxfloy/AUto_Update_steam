@@ -21,6 +21,7 @@ from fastapi.responses import JSONResponse
 from db.database import init_db, get_conn
 from routers.accounts import router as accounts_router
 from routers.admin import router as admin_router
+from routers.clientlogs import router as client_logs_router
 from routers.log import router as log_router
 
 # --- Логирование: консоль + файл с ротацией -------------------------------
@@ -100,6 +101,8 @@ async def lifespan(app: FastAPI):
     logger.info("  Панель админа:  http://%s:8000/", ip)
     logger.info("  Для клиентов в updater.ini:  server_url=http://%s:8000", ip)
     logger.info("  Лог-файл: %s", os.path.abspath(LOG_FILE))
+    logger.info("  Логи клиентов: POST /logs/ingest -> %s",
+                os.path.abspath(os.environ.get("STEAM_CLIENT_LOG_DIR", "logs")))
     logger.info("=" * 62)
 
     task = asyncio.create_task(cleanup_stale_loop())
@@ -115,6 +118,7 @@ app = FastAPI(title="Steam Club Account Manager", lifespan=lifespan)
 
 app.include_router(accounts_router)
 app.include_router(log_router)
+app.include_router(client_logs_router)
 app.include_router(admin_router)
 
 
