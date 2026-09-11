@@ -1,8 +1,8 @@
 // main.c - Steam Auto-Updater client, Win32 GUI entry point
 // Native Win32 UI: no external frameworks, single .exe
-// v6: readable log (opaque background, throttled steamcmd spam, CP fallback),
-//     persistent checkbox selection (selection.ini), rounded card layout,
-//     bigger hit targets, all v5 flicker fixes kept.
+// v7: verbose logging (rotating file + upload to the server), "Open log" button,
+//     build-id aware statuses ("OK (already latest)" now means nothing was
+//     downloaded at all), all v6 UI fixes kept.
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <commctrl.h>
@@ -16,6 +16,7 @@
 #include "worker.h"
 #include "lease.h"
 #include "catalog.h"
+#include "log.h"
 
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(linker, "/subsystem:windows")
@@ -37,6 +38,7 @@
 #define ID_BTN_CHECK_ALL   112
 #define ID_BTN_UNCHECK_ALL 113
 #define ID_BTN_CHECK_F2P   114
+#define ID_BTN_OPEN_LOG    115
 #define ID_TIMER_REFRESH   1001
 
 #define MAX_ROWS 128
@@ -48,6 +50,7 @@
 // steamcmd prints "Update state (0x61) downloading, progress: ..." several
 // times per second. Printing every one of them turned the log into noise, so
 // only one progress line per this many milliseconds reaches the log box.
+// The full stream still goes into the debug log file and to the server.
 #define LOG_PROGRESS_THROTTLE_MS 2000
 
 // --- Layout ----------------------------------------------------------------
@@ -55,6 +58,10 @@
 #define CARD_PAD      8   // visible rounded frame around a control
 #define RIGHT_W     250   // button column width
 #define COL_GAP      22
+#define Y_PROGRESS  434
+#define Y_STATUS    478
+#define Y_QUEUE     500
+#define Y_LOG       538
 
 // ---------------------------------------------------------------------------
 // Dark palette
@@ -109,6 +116,7 @@ static HWND          g_btn_abort       = NULL;
 static HWND          g_btn_check_all   = NULL;
 static HWND          g_btn_uncheck_all = NULL;
 static HWND          g_btn_check_f2p   = NULL;
+static HWND          g_btn_open_log    = NULL;
 static HWND          g_progress        = NULL;
 static HWND          g_status_txt      = NULL;
 static HWND          g_queue_txt       = NULL;
@@ -117,6 +125,7 @@ static HWND          g_log_txt         = NULL;
 static Config        g_cfg                 = {0};
 static char          g_cfg_path[MAX_PATH]  = {0};
 static char          g_logfile[MAX_PATH]   = {0};
+static char          g_dbglog[MAX_PATH]    = {0};
 static char          g_sel_path[MAX_PATH]  = {0};
 static GameRow       g_rows[MAX_ROWS]      = {0};
 static int           g_row_count           = 0;
@@ -138,6 +147,7 @@ static int           g_queue_len       = 0;
 static int           g_queue_pos       = 0;
 static int           g_current_row     = -1;
 static int           g_ok_count        = 0;
+static int           g_skip_count      = 0;
 static int           g_fail_count      = 0;
 static int           g_aborting        = 0;
 
@@ -176,6 +186,7 @@ static void      ProgressUpdate(WorkerState state, double raw_pct,
 static void      SelectionLoad(void);
 static void      SelectionSave(void);
 static int       SelectionContains(const char *appid);
+static void      OpenLogInNotepad(void);
 
 static const char *state_name(WorkerState s) {
     switch (s) {
@@ -253,6 +264,7 @@ static void SelectionSave(void) {
     fputs("# Steam Auto-Updater: games checked last time (one AppID per line)\n", f);
     for (int i = 0; i < g_sel_count; i++) fprintf(f, "%s\n", g_sel_ids[i]);
     fclose(f);
+    LOG_DEBUG("ui", "selection saved: %d row(s)", g_sel_count);
 }
 
 // ---------------------------------------------------------------------------
@@ -394,6 +406,20 @@ static void keep_awake(int on) {
     else    SetThreadExecutionState(ES_CONTINUOUS);
 }
 
+// Open the debug log without dragging shell32 into the link line.
+static void OpenLogInNotepad(void) {
+    const char *path = log_file_path();
+    if (!path || !path[0]) return;
+    char cmd[MAX_PATH + 32];
+    snprintf(cmd, sizeof(cmd), "notepad.exe \"%s\"", path);
+    STARTUPINFOA si = { sizeof(si) };
+    PROCESS_INFORMATION pi = {0};
+    if (CreateProcessA(NULL, cmd, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // WinMain
 // ---------------------------------------------------------------------------
@@ -431,17 +457,43 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow) {
                             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                             CLEARTYPE_QUALITY, FIXED_PITCH | FF_MODERN, "Consolas");
 
-    // config, log file and remembered selection live next to the exe
+    // config, log files and remembered selection live next to the exe
     GetModuleFileNameA(NULL, g_cfg_path, MAX_PATH);
     char *last_slash = strrchr(g_cfg_path, '\\');
     if (last_slash) *(last_slash + 1) = '\0';
     strncpy(g_logfile,  g_cfg_path, MAX_PATH - 1);
+    strncpy(g_dbglog,   g_cfg_path, MAX_PATH - 1);
     strncpy(g_sel_path, g_cfg_path, MAX_PATH - 1);
-    strncat(g_logfile,  "updater.log",   MAX_PATH - strlen(g_logfile)  - 1);
-    strncat(g_sel_path, "selection.ini", MAX_PATH - strlen(g_sel_path) - 1);
-    strncat(g_cfg_path, "updater.ini",   MAX_PATH - strlen(g_cfg_path) - 1);
+    strncat(g_logfile,  "updater.log",        MAX_PATH - strlen(g_logfile)  - 1);
+    strncat(g_dbglog,   "updater-debug.log",  MAX_PATH - strlen(g_dbglog)   - 1);
+    strncat(g_sel_path, "selection.ini",      MAX_PATH - strlen(g_sel_path) - 1);
+    strncat(g_cfg_path, "updater.ini",        MAX_PATH - strlen(g_cfg_path) - 1);
     int cfg_ok = config_load(g_cfg_path, &g_cfg);
     SelectionLoad();
+
+    // --- verbose logging: file next to the exe + upload to the server -----
+    // updater.log stays the short, human-readable UI log; updater-debug.log
+    // gets every single line (including the raw steamcmd stream) and the same
+    // lines are pushed to the server so 50 PCs can be debugged from one page.
+    log_init(g_dbglog, LOG_LEVEL_DEBUG);
+    char pc_name[64] = {0};
+    if (g_cfg.pc_id[0]) {
+        strncpy(pc_name, g_cfg.pc_id, sizeof(pc_name) - 1);
+    } else {
+        DWORD n = sizeof(pc_name);
+        GetComputerNameA(pc_name, &n);
+    }
+    log_set_pc_id(pc_name);
+    if (g_cfg.server_url[0] && g_cfg.api_key[0]) {
+        log_set_remote(g_cfg.server_url, g_cfg.api_key, 1);
+        log_set_remote_level(LOG_LEVEL_DEBUG);
+    }
+    LOG_INFO("app", "=== Steam Auto-Updater v7.0 starting, session %s ===", log_session_id());
+    LOG_INFO("app", "pc_id=%s server=%s steamcmd=%s",
+             pc_name,
+             g_cfg.server_url[0] ? g_cfg.server_url : "(not set)",
+             g_cfg.steamcmd_path[0] ? g_cfg.steamcmd_path : "(not set)");
+    LOG_INFO("app", "debug log: %s", g_dbglog);
 
     InitializeCriticalSection(&g_wstatus.lock);
 
@@ -469,9 +521,9 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow) {
     // WS_EX_COMPOSITED (an XP-era double-buffering hack) fights with DWM on
     // Windows 10/11 and with the ListView's own double buffering.
     g_hwnd = CreateWindowExA(WS_EX_APPWINDOW, "SteamAutoUpdater",
-                              "Steam Auto-Updater v6.0 (F2P)",
+                              "Steam Auto-Updater v7.0 (F2P)",
                               WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
-                              CW_USEDEFAULT, CW_USEDEFAULT, 980, 800,
+                              CW_USEDEFAULT, CW_USEDEFAULT, 1000, 860,
                               NULL, NULL, hInst, NULL);
     enable_dark_titlebar(g_hwnd);
     ShowWindow(g_hwnd, nShow);
@@ -484,6 +536,9 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow) {
     }
 
     keep_awake(0);
+    LOG_INFO("app", "=== exiting, %d ok / %d failed in this session ===",
+             g_ok_count, g_fail_count);
+    log_shutdown();
     DeleteCriticalSection(&g_wstatus.lock);
     if (g_single_inst) { ReleaseMutex(g_single_inst); CloseHandle(g_single_inst); }
     return (int)msg.wParam;
@@ -521,7 +576,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_list = CreateWindowExA(0, WC_LISTVIEWA, "",
             WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | LVS_REPORT | LVS_SINGLESEL
             | LVS_SHOWSELALWAYS | LVS_NOSORTHEADER,
-            PAD, 60, 620, 306, hwnd, (HMENU)ID_LIST_GAMES, hi, NULL);
+            PAD, 60, 620, 344, hwnd, (HMENU)ID_LIST_GAMES, hi, NULL);
         ListView_SetExtendedListViewStyle(g_list,
             LVS_EX_CHECKBOXES | LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
         SendMessage(g_list, WM_SETFONT, (WPARAM)g_font_ui, TRUE);
@@ -551,28 +606,29 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_btn_check_f2p   = make_button(hwnd, "Select all except PAID",ID_BTN_CHECK_F2P,   bx, 236, RIGHT_W, 34, 0);
         g_btn_refresh     = make_button(hwnd, "Refresh list",          ID_BTN_REFRESH,     bx, 282, RIGHT_W, 34, 0);
         g_btn_settings    = make_button(hwnd, "Settings",              ID_BTN_SETTINGS,    bx, 320, RIGHT_W, 34, 0);
-        g_btn_abort       = make_button(hwnd, "Abort",                 ID_BTN_ABORT,       bx, 366, RIGHT_W, 36, 1);
+        g_btn_open_log    = make_button(hwnd, "Open debug log",        ID_BTN_OPEN_LOG,    bx, 358, RIGHT_W, 34, 0);
+        g_btn_abort       = make_button(hwnd, "Abort",                 ID_BTN_ABORT,       bx, 404, RIGHT_W, 36, 1);
 
         // Our own progress bar: a static we paint ourselves, so it can be dark
         // and can show percentage, stage, bytes, speed and ETA inside the bar.
         g_progress = CreateWindowA("STATIC", "",
             WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | SS_OWNERDRAW,
-            PAD, 396, 900, 34, hwnd, (HMENU)ID_PROGRESS, hi, NULL);
+            PAD, Y_PROGRESS, 900, 34, hwnd, (HMENU)ID_PROGRESS, hi, NULL);
 
         g_status_txt = CreateWindowA("STATIC", "Idle",
             WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | SS_LEFT | SS_ENDELLIPSIS,
-            PAD, 440, 900, 20, hwnd, (HMENU)ID_STATUS_TEXT, hi, NULL);
+            PAD, Y_STATUS, 900, 20, hwnd, (HMENU)ID_STATUS_TEXT, hi, NULL);
         SendMessage(g_status_txt, WM_SETFONT, (WPARAM)g_font_ui, TRUE);
 
         g_queue_txt = CreateWindowA("STATIC", "Queue: empty",
             WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | SS_LEFT | SS_ENDELLIPSIS,
-            PAD, 462, 900, 20, hwnd, (HMENU)ID_QUEUE_TEXT, hi, NULL);
+            PAD, Y_QUEUE, 900, 20, hwnd, (HMENU)ID_QUEUE_TEXT, hi, NULL);
         SendMessage(g_queue_txt, WM_SETFONT, (WPARAM)g_font_ui, TRUE);
 
         g_log_txt = CreateWindowExA(0, "EDIT", "",
             WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_VSCROLL
             | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
-            PAD, 500, 900, 250, hwnd, (HMENU)ID_LOG_TEXT, hi, NULL);
+            PAD, Y_LOG, 900, 250, hwnd, (HMENU)ID_LOG_TEXT, hi, NULL);
         SendMessage(g_log_txt, EM_SETLIMITTEXT, 262144, 0);
         SendMessage(g_log_txt, WM_SETFONT, (WPARAM)g_font_mono, TRUE);
 
@@ -591,6 +647,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             AppendLog("WARNING: steamcmd.exe not found at the configured path.");
         if (!g_cfg.pc_id[0])
             AppendLog("WARNING: pc_id is empty. The server log will not show which PC this is.");
+
+        char sess[160];
+        snprintf(sess, sizeof(sess),
+                 "Debug log: %s   (session %s, mirrored to the server)",
+                 g_dbglog, log_session_id());
+        AppendLog(sess);
 
         SetTimer(hwnd, ID_TIMER_REFRESH, 100, NULL);
         break;
@@ -772,6 +834,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_queue_len = 0;
             g_queue_pos = 0;
             g_ok_count  = 0;
+            g_skip_count = 0;
             g_fail_count = 0;
             g_aborting   = 0;
 
@@ -824,6 +887,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         return 0;
                 }
             }
+            LOG_INFO("ui", "queue started: %d game(s)", g_queue_len);
             StartQueue();
         }
         else if (ctrl_id == ID_BTN_CHECK_ALL) {
@@ -855,6 +919,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             char b[96];
             snprintf(b, sizeof(b), "Checked %d free-to-play rows, paid titles skipped.", n);
             AppendLog(b);
+        }
+        else if (ctrl_id == ID_BTN_OPEN_LOG) {
+            OpenLogInNotepad();
         }
         else if (ctrl_id == ID_BTN_ABORT) {
             if (MessageBoxA(hwnd,
@@ -900,7 +967,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             int full_w = w - PAD * 2;
 
             MoveWindow(g_title_txt,       PAD, 14, list_w, 28, TRUE);
-            MoveWindow(g_list,            PAD, 60, list_w, 306, TRUE);
+            MoveWindow(g_list,            PAD, 60, list_w, 344, TRUE);
             MoveWindow(g_btn_update_all,  bx, 60,  RIGHT_W, 44, TRUE);
             MoveWindow(g_btn_update,      bx, 114, RIGHT_W, 36, TRUE);
             MoveWindow(g_btn_check_all,   bx, 160, RIGHT_W, 34, TRUE);
@@ -908,11 +975,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             MoveWindow(g_btn_check_f2p,   bx, 236, RIGHT_W, 34, TRUE);
             MoveWindow(g_btn_refresh,     bx, 282, RIGHT_W, 34, TRUE);
             MoveWindow(g_btn_settings,    bx, 320, RIGHT_W, 34, TRUE);
-            MoveWindow(g_btn_abort,       bx, 366, RIGHT_W, 36, TRUE);
-            MoveWindow(g_progress,   PAD, 396, full_w, 34, TRUE);
-            MoveWindow(g_status_txt, PAD, 440, full_w, 20, TRUE);
-            MoveWindow(g_queue_txt,  PAD, 462, full_w, 20, TRUE);
-            MoveWindow(g_log_txt,    PAD, 500, full_w, h > 560 ? h - 500 - PAD - CARD_PAD : 40, TRUE);
+            MoveWindow(g_btn_open_log,    bx, 358, RIGHT_W, 34, TRUE);
+            MoveWindow(g_btn_abort,       bx, 404, RIGHT_W, 36, TRUE);
+            MoveWindow(g_progress,   PAD, Y_PROGRESS, full_w, 34, TRUE);
+            MoveWindow(g_status_txt, PAD, Y_STATUS,   full_w, 20, TRUE);
+            MoveWindow(g_queue_txt,  PAD, Y_QUEUE,    full_w, 20, TRUE);
+            MoveWindow(g_log_txt,    PAD, Y_LOG, full_w,
+                       h > Y_LOG + 80 ? h - Y_LOG - PAD - CARD_PAD : 40, TRUE);
             // The cards are painted by the parent, so the whole frame must be
             // redrawn after a resize or the old rounded outlines stay behind.
             InvalidateRect(hwnd, NULL, FALSE);
@@ -922,8 +991,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_GETMINMAXINFO: {
         MINMAXINFO *mmi = (MINMAXINFO *)lp;
-        mmi->ptMinTrackSize.x = 900;
-        mmi->ptMinTrackSize.y = 700;
+        mmi->ptMinTrackSize.x = 920;
+        mmi->ptMinTrackSize.y = 740;
         break;
     }
 
@@ -952,6 +1021,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         keep_awake(0);
         KillTimer(hwnd, ID_TIMER_REFRESH);
+        log_flush_remote(4000);
         PostQuitMessage(0);
         break;
     }
@@ -1003,12 +1073,14 @@ static double stage_map(const char *stage, double raw) {
     if (raw > 100.0) raw = 100.0;
     if (!stage || !stage[0]) return raw * 0.90;
 
+    if (strstr(stage, "checking"))    return 0.5;                 // build-id probe
     if (strstr(stage, "prealloc"))    return 0.0  + raw * 0.02;   //  0 -  2 %
     if (strstr(stage, "download"))    return 2.0  + raw * 0.86;   //  2 - 88 %
     if (strstr(stage, "verif"))       return 88.0 + raw * 0.07;   // 88 - 95 %
     if (strstr(stage, "commit"))      return 95.0 + raw * 0.04;   // 95 - 99 %
     if (strstr(stage, "reconfig"))    return 99.0;
     if (strstr(stage, "validat"))     return 88.0 + raw * 0.07;
+    if (strstr(stage, "already"))     return 100.0;
     return raw * 0.90;
 }
 
@@ -1220,19 +1292,22 @@ static void RefreshGameList(void) {
 // Queue handling
 // ---------------------------------------------------------------------------
 static void SetQueueText(void) {
-    char buf[256];
+    char buf[300];
     if (g_queue_len == 0) {
         snprintf(buf, sizeof(buf), "Queue: empty");
     } else {
         int cur = g_queue_pos > 0 ? g_queue_pos : 1;
         char el[32] = {0};
         fmt_secs((double)((GetTickCount64() - g_tick_job_start) / 1000), el, sizeof(el));
+        int pending = log_pending_count();
         snprintf(buf, sizeof(buf),
-                 "Queue: %d / %d   |   OK: %d   Failed: %d   |   current game: %s",
-                 cur, g_queue_len, g_ok_count, g_fail_count, el);
+                 "Queue: %d / %d   |   OK: %d   Up-to-date: %d   Failed: %d   |   "
+                 "current game: %s%s",
+                 cur, g_queue_len, g_ok_count, g_skip_count, g_fail_count, el,
+                 pending > 50 ? "   |   log upload lagging" : "");
     }
     // Rewriting identical text 10 times per second makes the label flash.
-    char old[256] = {0};
+    char old[300] = {0};
     GetWindowTextA(g_queue_txt, old, sizeof(old) - 1);
     if (strcmp(old, buf) != 0) SetWindowTextA(g_queue_txt, buf);
 }
@@ -1272,6 +1347,10 @@ static int StartRow(int row_idx) {
              g_rows[row_idx].installed ? "Updating" : "Installing",
              g_rows[row_idx].name, g_rows[row_idx].appid);
     AppendLog(buf);
+    LOG_INFO("ui", "starting row %d: app %s (%s), installed=%d, local build %s",
+             row_idx, g_rows[row_idx].appid, g_rows[row_idx].name,
+             g_rows[row_idx].installed,
+             g_rows[row_idx].buildid[0] ? g_rows[row_idx].buildid : "-");
 
     strncpy(g_rows[row_idx].status, g_rows[row_idx].installed ? "Updating..." : "Installing...",
             sizeof(g_rows[row_idx].status)-1);
@@ -1286,6 +1365,7 @@ static int StartRow(int row_idx) {
     g_worker = worker_start(&cfg, &g_wstatus);
     if (!g_worker) {
         AppendLog("ERROR: failed to start the worker thread.");
+        LOG_ERROR("ui", "CreateThread for the worker failed (app %s)", g_rows[row_idx].appid);
         g_fail_count++;
         strncpy(g_rows[row_idx].status, "FAILED: thread", sizeof(g_rows[row_idx].status)-1);
         g_rows[row_idx].result = 2;
@@ -1349,9 +1429,9 @@ static void UpdateUIFromWorker(void) {
     static ULONGLONG last_progress_log = 0;
     if (logline[0] && strcmp(logline, last_log) != 0) {
         // steamcmd repeats "Update state (0x61) downloading, progress: ..."
-        // several times per second. The bar already shows that; the log only
-        // needs a sample now and then, otherwise it scrolls into unreadable
-        // noise and hides the lines that actually matter.
+        // several times per second. The bar already shows that; the log box
+        // only needs a sample now and then. The debug log file and the server
+        // still receive every line from worker.c / steamcmd.c.
         int is_progress = (strstr(logline, "Update state") != NULL);
         ULONGLONG now = GetTickCount64();
         if (!is_progress || now - last_progress_log >= LOG_PROGRESS_THROTTLE_MS) {
@@ -1384,7 +1464,6 @@ static void UpdateUIFromWorker(void) {
 
     if (g_current_row >= 0 && g_current_row < g_row_count) {
         if (state == WORKER_DONE_OK) {
-            g_ok_count++;
             char st[64];
             EnterCriticalSection(&g_wstatus.lock);
             int same_build = (g_wstatus.build_id_before[0] && g_wstatus.build_id_after[0] &&
@@ -1392,13 +1471,18 @@ static void UpdateUIFromWorker(void) {
             strncpy(g_rows[g_current_row].buildid, g_wstatus.build_id_after,
                     sizeof(g_rows[g_current_row].buildid)-1);
             LeaveCriticalSection(&g_wstatus.lock);
+            // "already latest" now really means nothing was downloaded and no
+            // files were hashed: the build id matched before we started.
+            if (same_build) g_skip_count++; else g_ok_count++;
             snprintf(st, sizeof(st), same_build ? "OK (already latest)" : "OK (updated)");
             strncpy(g_rows[g_current_row].status, st, sizeof(g_rows[g_current_row].status)-1);
             g_rows[g_current_row].installed = 1;
             g_rows[g_current_row].result    = 1;
             ListView_SetItemText(g_list, g_current_row, 3, g_rows[g_current_row].buildid);
-            DrawProgress(100.0, "complete", 0, 0);
-            AppendLog(">>> Done.");
+            DrawProgress(100.0, same_build ? "already up to date" : "complete", 0, 0);
+            AppendLog(same_build ? ">>> Already up to date, nothing downloaded." : ">>> Done.");
+            LOG_INFO("ui", "row done: app %s -> %s (build %s)",
+                     g_rows[g_current_row].appid, st, g_rows[g_current_row].buildid);
         } else {
             g_fail_count++;
             snprintf(g_rows[g_current_row].status, sizeof(g_rows[g_current_row].status),
@@ -1409,6 +1493,8 @@ static void UpdateUIFromWorker(void) {
             snprintf(fail_msg, sizeof(fail_msg), ">>> Failed: %s",
                      errmsg[0] ? errmsg : "Unknown error");
             AppendLog(fail_msg);
+            LOG_ERROR("ui", "row failed: app %s: %s",
+                      g_rows[g_current_row].appid, errmsg[0] ? errmsg : "unknown");
         }
         ListView_SetItemText(g_list, g_current_row, 4, g_rows[g_current_row].status);
     }
@@ -1428,11 +1514,15 @@ static void UpdateUIFromWorker(void) {
     keep_awake(0);
 
     char summary[256];
-    snprintf(summary, sizeof(summary), "%s Success: %d, failed: %d.",
-             g_aborting ? "Aborted." : "Finished.", g_ok_count, g_fail_count);
+    snprintf(summary, sizeof(summary),
+             "%s Updated: %d, already up to date: %d, failed: %d.",
+             g_aborting ? "Aborted." : "Finished.",
+             g_ok_count, g_skip_count, g_fail_count);
     SetWindowTextA(g_status_txt, summary);
     DrawProgress(100.0, summary, g_fail_count ? 1 : 0, 0);
     AppendLog(summary);
+    LOG_INFO("ui", "%s", summary);
+    log_flush_remote(4000);
 
     // Refresh sizes / build ids so the list matches reality after the run.
     RefreshGameList();
@@ -1442,10 +1532,14 @@ static void UpdateUIFromWorker(void) {
 }
 
 // ---------------------------------------------------------------------------
-// AppendLog: to the on-screen log and to updater.log next to the exe.
+// AppendLog: on-screen log + updater.log next to the exe + debug log/server.
 // ---------------------------------------------------------------------------
 static void AppendLog(const char *line) {
     if (!line || !line[0]) return;
+
+    // Everything the operator sees also goes into the verbose log and to the
+    // server, so a remote session can be reconstructed line by line.
+    log_raw("ui", line);
 
     if (g_logfile[0]) {
         FILE *f = fopen(g_logfile, "a");
@@ -1626,6 +1720,10 @@ LRESULT CALLBACK SettingsDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     "out of Program Files.", "Save failed", MB_OK | MB_ICONERROR);
                 return 0;
             }
+            // Logging targets can change with the settings: re-point them now.
+            log_set_pc_id(g_cfg.pc_id);
+            log_set_remote(g_cfg.server_url, g_cfg.api_key, 1);
+            LOG_INFO("ui", "settings saved: pc_id=%s server=%s", g_cfg.pc_id, g_cfg.server_url);
             AppendLog("Settings saved.");
             DestroyWindow(hwnd);
         }
