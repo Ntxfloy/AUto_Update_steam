@@ -9,31 +9,39 @@
     --bg:#18181b; --panel:#202024; --panel2:#26262b; --border:#3a3a40;
     --text:#ebebf0; --dim:#9a9aa4; --accent:#3b82f6; --accent2:#60a5fa;
     --ok:#22c55e; --warn:#eab308; --fail:#ef4444;
+    --wrap:1200px;
   }
   *{box-sizing:border-box}
-  body{margin:0;background:var(--bg);color:var(--text);
-    font:14px/1.5 "Segoe UI",system-ui,sans-serif}
-  header{display:flex;align-items:center;gap:16px;padding:14px 22px;
-    background:var(--panel);border-bottom:1px solid var(--border);
-    position:sticky;top:0;z-index:10;flex-wrap:wrap}
+  body{margin:0;background:var(--bg);color:var(--text);min-height:100vh;
+    overflow-x:hidden;font:14px/1.5 "Segoe UI",system-ui,sans-serif}
+  /* The bars span the full width, their contents stay in one centred column,
+     otherwise on a 2560px monitor the login box flies off to the far right. */
+  header{background:var(--panel);border-bottom:1px solid var(--border);
+    position:sticky;top:0;z-index:10;width:100%}
+  .header-inner{display:flex;align-items:center;gap:16px;padding:14px 22px;
+    max-width:var(--wrap);margin:0 auto;width:100%;flex-wrap:wrap}
   h1{font-size:16px;margin:0;font-weight:600}
   .spacer{flex:1}
-  .tabs{display:flex;gap:4px;padding:0 22px;background:var(--panel);
-    border-bottom:1px solid var(--border);flex-wrap:wrap}
+  .tabs-bar{background:var(--panel);border-bottom:1px solid var(--border);width:100%}
+  .tabs{display:flex;gap:4px;padding:0 22px;max-width:var(--wrap);margin:0 auto;
+    width:100%;flex-wrap:wrap}
   .tab{padding:10px 16px;cursor:pointer;color:var(--dim);
     border-bottom:2px solid transparent;user-select:none}
   .tab:hover{color:var(--text)}
   .tab.active{color:var(--text);border-bottom-color:var(--accent)}
-  main{padding:22px;max-width:1200px}
+  main{padding:22px;max-width:var(--wrap);margin:0 auto;width:100%}
   .page{display:none} .page.active{display:block}
   .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:22px}
   .card{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:14px 16px}
   .card .v{font-size:26px;font-weight:600}
   .card .l{color:var(--dim);font-size:12px;text-transform:uppercase;letter-spacing:.5px}
-  table{width:100%;border-collapse:collapse;background:var(--panel);
-    border:1px solid var(--border);border-radius:10px;overflow:hidden}
+  /* Wide rows scroll inside their own box instead of stretching the page. */
+  .table-wrap{width:100%;overflow-x:auto;border:1px solid var(--border);
+    border-radius:10px;background:var(--panel)}
+  table{width:100%;border-collapse:collapse;background:var(--panel);min-width:640px}
   th{text-align:left;padding:10px 12px;background:var(--panel2);color:var(--dim);
-    font-size:12px;text-transform:uppercase;letter-spacing:.4px;font-weight:600}
+    font-size:12px;text-transform:uppercase;letter-spacing:.4px;font-weight:600;
+    position:sticky;top:0}
   td{padding:9px 12px;border-top:1px solid var(--border);vertical-align:middle}
   tr:hover td{background:#2a2a30}
   .pill{display:inline-block;padding:2px 9px;border-radius:99px;font-size:12px;font-weight:600}
@@ -50,7 +58,7 @@
   button.sm{padding:4px 9px;font-size:12px}
   button:disabled{opacity:.45;cursor:not-allowed}
   input,textarea,select{background:#1c1c20;color:var(--text);border:1px solid var(--border);
-    border-radius:8px;padding:9px 11px;font:inherit;width:100%}
+    border-radius:8px;padding:9px 11px;font:inherit;width:100%;max-width:100%}
   input:focus,textarea:focus{outline:none;border-color:var(--accent)}
   textarea{min-height:230px;font-family:Consolas,monospace;font-size:13px;resize:vertical}
   label{display:block;color:var(--dim);font-size:12px;margin:0 0 5px}
@@ -71,25 +79,36 @@
   .toast.err{border-left-color:var(--fail)}
   .toast.ok{border-left-color:var(--ok)}
   .stale{color:var(--warn)}
+  @media (max-width:760px){
+    .header-inner{padding:12px 14px}
+    .tabs{padding:0 10px}
+    main{padding:14px}
+    #keyBox{width:100%;max-width:none}
+    #keyBox input{width:100%}
+  }
 </style>
 </head>
 <body>
 <header>
-  <h1>🎮 Steam Club — панель админа</h1>
-  <span class="hint"><span id="hDot" class="dot off"></span><span id="hText">проверка…</span></span>
-  <div class="spacer"></div>
-  <div id="keyBox">
-    <input id="apiKey" type="password" placeholder="API ключ (STEAM_API_KEY)" autocomplete="off">
-    <button class="primary" onclick="saveKey()">Войти</button>
+  <div class="header-inner">
+    <h1>🎮 Steam Club — панель админа</h1>
+    <span class="hint"><span id="hDot" class="dot off"></span><span id="hText">проверка…</span></span>
+    <div class="spacer"></div>
+    <div id="keyBox">
+      <input id="apiKey" type="password" placeholder="API ключ (STEAM_API_KEY)" autocomplete="off">
+      <button class="primary" onclick="saveKey()">Войти</button>
+    </div>
   </div>
 </header>
 
-<div class="tabs">
-  <div class="tab active" data-p="overview">Обзор</div>
-  <div class="tab" data-p="accounts">Аккаунты</div>
-  <div class="tab" data-p="bulk">Добавить пачкой</div>
-  <div class="tab" data-p="log">Журнал обновлений</div>
-  <div class="tab" data-p="srvlog">Лог сервера</div>
+<div class="tabs-bar">
+  <div class="tabs">
+    <div class="tab active" data-p="overview">Обзор</div>
+    <div class="tab" data-p="accounts">Аккаунты</div>
+    <div class="tab" data-p="bulk">Добавить пачкой</div>
+    <div class="tab" data-p="log">Журнал обновлений</div>
+    <div class="tab" data-p="srvlog">Лог сервера</div>
+  </div>
 </div>
 
 <main>
@@ -108,8 +127,10 @@
       <div class="spacer"></div>
       <button class="danger" onclick="forceRelease()">Снять все аренды</button>
     </div>
-    <table><thead><tr><th>ПК</th><th>Аккаунт</th><th>Heartbeat</th></tr></thead>
-      <tbody id="pcsBody"><tr><td colspan="3" class="hint">—</td></tr></tbody></table>
+    <div class="table-wrap">
+      <table><thead><tr><th>ПК</th><th>Аккаунт</th><th>Heartbeat</th></tr></thead>
+        <tbody id="pcsBody"><tr><td colspan="3" class="hint">—</td></tr></tbody></table>
+    </div>
   </section>
 
   <!-- АККАУНТЫ -->
@@ -125,9 +146,11 @@
       <button onclick="reviveBad()">Вернуть все битые в пул</button>
       <button class="primary" onclick="refresh()">Обновить</button>
     </div>
-    <table><thead><tr><th style="width:60px">ID</th><th>Логин</th><th style="width:110px">Статус</th>
-      <th style="width:120px">На ПК</th><th style="width:90px">F2P</th><th style="width:220px"></th></tr></thead>
-      <tbody id="accBody"></tbody></table>
+    <div class="table-wrap">
+      <table><thead><tr><th style="width:60px">ID</th><th>Логин</th><th style="width:110px">Статус</th>
+        <th style="width:120px">На ПК</th><th style="width:90px">F2P</th><th style="width:220px"></th></tr></thead>
+        <tbody id="accBody"></tbody></table>
+    </div>
   </section>
 
   <!-- ПАЧКОЙ -->
@@ -163,9 +186,11 @@
       <input id="logPc" placeholder="Фильтр по PC-ID…" style="max-width:200px">
       <button onclick="loadLog()">Применить</button>
     </div>
-    <table><thead><tr><th>ПК</th><th>AppID</th><th>Результат</th><th>Build</th>
-      <th>Ошибка</th><th>Завершено</th></tr></thead>
-      <tbody id="logBody"></tbody></table>
+    <div class="table-wrap">
+      <table><thead><tr><th>ПК</th><th>AppID</th><th>Результат</th><th>Build</th>
+        <th>Ошибка</th><th>Завершено</th></tr></thead>
+        <tbody id="logBody"></tbody></table>
+    </div>
   </section>
 
   <!-- ЛОГ СЕРВЕРА -->
