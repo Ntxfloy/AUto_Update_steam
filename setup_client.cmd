@@ -122,30 +122,33 @@ if not defined STEAMCMD_EXE (
 rem 3. Download or update steam_updater.exe
 set "CLIENT_EXE=!TARGET_DIR!\steam_updater.exe"
 
-if exist "!CLIENT_EXE!" (
-    if "!FORCE_UPDATE!"=="1" (
-        echo [*] Update requested. Downloading latest steam_updater.exe from GitHub...
-        powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-            "$ProgressPreference = 'SilentlyContinue';" ^
-            "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12;" ^
-            "Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/Ntxfloy/AUto_Update_steam/fix/delta-and-reliability/client_build/steam_updater.exe' -OutFile '!CLIENT_EXE!' -UseBasicParsing;"
-        echo [+] steam_updater.exe updated.
-    ) else (
-        echo [+] steam_updater.exe already installed.
-    )
-) else (
-    echo [*] Downloading steam_updater.exe from GitHub...
-    powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-        "$ProgressPreference = 'SilentlyContinue';" ^
-        "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12;" ^
-        "Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/Ntxfloy/AUto_Update_steam/fix/delta-and-reliability/client_build/steam_updater.exe' -OutFile '!CLIENT_EXE!' -UseBasicParsing;"
-    
-    if exist "!CLIENT_EXE!" (
-        echo [+] steam_updater.exe downloaded successfully.
-    ) else (
-        echo [!] Error downloading steam_updater.exe!
-    )
-)
+powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+    "$ProgressPreference = 'SilentlyContinue';" ^
+    "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12;" ^
+    "$url = 'https://raw.githubusercontent.com/Ntxfloy/AUto_Update_steam/fix/delta-and-reliability/client_build/steam_updater.exe';" ^
+    "$dst = '!CLIENT_EXE!';" ^
+    "$need = $false;" ^
+    "if ('!FORCE_UPDATE!' -eq '1' -or -not (Test-Path $dst)) { $need = $true }" ^
+    "else {" ^
+    "    try {" ^
+    "        $head = Invoke-WebRequest -Uri $url -Method Head -UseBasicParsing -TimeoutSec 5;" ^
+    "        $remLen = [int64]$head.Headers['Content-Length'];" ^
+    "        $locLen = (Get-Item $dst).Length;" ^
+    "        if ($remLen -gt 0 -and $remLen -ne $locLen) { $need = $true }" ^
+    "    } catch { $need = $false }" ^
+    "};" ^
+    "if ($need) {" ^
+    "    Write-Host '[*] Downloading latest steam_updater.exe from GitHub...';" ^
+    "    Invoke-WebRequest -Uri $url -OutFile ($dst + '.tmp') -UseBasicParsing -TimeoutSec 30;" ^
+    "    if (Test-Path ($dst + '.tmp')) {" ^
+    "        Move-Item -Path ($dst + '.tmp') -Destination $dst -Force;" ^
+    "        Write-Host '[+] steam_updater.exe updated successfully.';" ^
+    "    } else {" ^
+    "        Write-Host '[-] Error downloading steam_updater.exe.';" ^
+    "    }" ^
+    "} else {" ^
+    "    Write-Host '[+] steam_updater.exe is up to date.';" ^
+    "}"
 
 rem ---------------------------------------------------
 rem 4. Check, Create or Update updater.ini
