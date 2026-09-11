@@ -9,7 +9,9 @@ set "SERVER_PORT=8000"
 set "API_KEY=zOTHOQY4gcdx6xSg5RzT-G-u9xJJABivqXjrgz_IlLA"
 
 rem Flags
-set "DO_RUN=0"
+rem Set DO_RUN=1 to launch updater after setup (ideal for club shell autostart)
+rem Set FORCE_UPDATE=1 when you want all PCs to re-download latest exe from GitHub
+set "DO_RUN=1"
 set "FORCE_UPDATE=0"
 
 rem Check Command Line Argument 1
