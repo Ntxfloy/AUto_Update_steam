@@ -1,5 +1,6 @@
 // worker.c - Background update worker thread implementation
-// v4: install-target policy, credential failover, delta updates, crash recovery
+// v6: deeper account failover (12 tries), duplicate-handout tolerance,
+//     de-duplicated status logging.
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <stdio.h>
@@ -17,7 +18,14 @@
 #define MIN_INSTALL_DISK_BYTES  (500ULL * 1000ULL * 1000ULL * 1000ULL)
 
 // How many different pool accounts to try before giving up on one game.
-#define MAX_ACCOUNT_ATTEMPTS 3
+// A club pool is 20+ accounts and some of them always have a stale password
+// or a Steam Guard lock, so three tries was far too shy: the whole game was
+// marked FAILED while a dozen perfectly good logins sat unused.
+#define MAX_ACCOUNT_ATTEMPTS 12
+
+// If the server keeps handing out an account we already burned (it failed to
+// flip it to status='bad'), give it a few chances before bailing out.
+#define MAX_DUPLICATE_HANDOUTS 4
 
 static volatile int  g_abort_requested = 0;   // stops heartbeat thread
 static volatile int  g_user_abort      = 0;   // user pressed Abort
@@ -43,10 +51,17 @@ static void set_progress(double p, const char *desc) {
     LeaveCriticalSection(&g_status->lock);
 }
 
+// The GUI polls last_log_line 10 times a second and prints it whenever it
+// differs from the previous one. Writing the same sentence again (which the
+// retry loop did constantly) produced the duplicated, interleaved mess in the
+// log box, so drop identical repeats right here at the source.
 static void set_log(const char *line) {
+    if (!line || !line[0]) return;
     EnterCriticalSection(&g_status->lock);
-    strncpy(g_status->last_log_line, line, 511);
-    g_status->last_log_line[511] = '\0';
+    if (strncmp(g_status->last_log_line, line, 511) != 0) {
+        strncpy(g_status->last_log_line, line, 511);
+        g_status->last_log_line[511] = '\0';
+    }
     LeaveCriticalSection(&g_status->lock);
 }
 
@@ -278,24 +293,28 @@ static DWORD WINAPI worker_thread(LPVOID arg) {
     int            aborted  = 0;
     int            tried_ids[MAX_ACCOUNT_ATTEMPTS] = {0};
     int            attempts = 0;
+    int            duplicates = 0;
     char           last_err[256] = {0};
 
     // ---- 3..8. Try accounts until one of them actually works -------------
     while (attempts < MAX_ACCOUNT_ATTEMPTS) {
         ApiAcquireResult account = {0};
 
+        if (g_user_abort) { aborted = 1; break; }
+
         set_state(WORKER_ACQUIRING);
         if (!api_acquire(cfg->pc_id, cfg->app_id, owner, &account)) {
             if (attempts == 0)
                 strncpy(last_err, "Failed to acquire a Steam account from the server.", 255);
             else
-                strncpy(last_err, "No more usable accounts in the pool.", 255);
+                snprintf(last_err, sizeof(last_err),
+                         "No more usable accounts in the pool (tried %d).", attempts);
             break;
         }
 
-        // The server should never hand out the same account twice in a row
-        // here, but if it does (e.g. it was not marked bad), stop instead of
-        // hammering the same broken credentials.
+        // The server should mark a rejected account as 'bad', but if it hands
+        // the same one out again we simply put it back and ask for another
+        // instead of hammering credentials we already know are broken.
         int repeat = 0;
         for (int i = 0; i < attempts; i++)
             if (tried_ids[i] == account.account_id) repeat = 1;
@@ -303,16 +322,27 @@ static DWORD WINAPI worker_thread(LPVOID arg) {
             api_release(account.lease_token, cfg->pc_id, RELEASE_FAILED,
                         cfg->app_id, "Duplicate account handed out", NULL, NULL);
             SecureZeroMemory(account.password, sizeof(account.password));
-            strncpy(last_err, "Server keeps returning the same failing account.", 255);
-            break;
+            if (++duplicates >= MAX_DUPLICATE_HANDOUTS) {
+                strncpy(last_err, "Server keeps returning the same failing account.", 255);
+                break;
+            }
+            {
+                char msg[160];
+                snprintf(msg, sizeof(msg),
+                         "Server returned account #%d again - asking for another one...",
+                         account.account_id);
+                set_log(msg);
+            }
+            Sleep(1500);
+            continue;
         }
         tried_ids[attempts] = account.account_id;
         attempts++;
 
         {
-            char msg[160];
-            snprintf(msg, sizeof(msg), "Using pool account #%d (attempt %d of %d).",
-                     account.account_id, attempts, MAX_ACCOUNT_ATTEMPTS);
+            char msg[192];
+            snprintf(msg, sizeof(msg), "Using pool account #%d (%s) - attempt %d of %d.",
+                     account.account_id, account.login, attempts, MAX_ACCOUNT_ATTEMPTS);
             set_log(msg);
         }
 
@@ -412,14 +442,23 @@ static DWORD WINAPI worker_thread(LPVOID arg) {
         // different login would just waste another 10 minutes.
         if (result != STEAMCMD_ERROR_AUTH && result != STEAMCMD_ERROR_NO_LICENSE) break;
 
+        if (attempts >= MAX_ACCOUNT_ATTEMPTS) {
+            snprintf(last_err, sizeof(last_err),
+                     "%d pool accounts rejected in a row (last: %s). Check the account pool.",
+                     attempts, err_msg ? err_msg : "unknown");
+            break;
+        }
+
         {
             char msg[256];
             snprintf(msg, sizeof(msg),
-                     "Account #%d rejected (%s) - marked bad on the server, taking another one...",
-                     account.account_id, err_msg ? err_msg : "unknown");
+                     "Account #%d rejected (%s) - marked bad on the server, taking another one (%d/%d)...",
+                     account.account_id, err_msg ? err_msg : "unknown",
+                     attempts, MAX_ACCOUNT_ATTEMPTS);
             set_log(msg);
         }
         set_progress(0.0, "retrying with another account");
+        Sleep(1000);
     }
 
     // ---- 9. Result -------------------------------------------------------
