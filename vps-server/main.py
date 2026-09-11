@@ -24,6 +24,16 @@ from routers.admin import router as admin_router
 from routers.clientlogs import router as client_logs_router
 from routers.log import router as log_router
 
+# Через сколько секунд без heartbeat аренда считается брошенной.
+#
+# Было 90 секунд, и это оказалось слишком жёстко: heartbeat идёт раз в 15 с, а
+# во время закачки на полной скорости канал клуба легко глотает несколько
+# запросов подряд (плюс перезапуск сервера). Шесть потерянных ударов — и
+# аккаунт уходил в пул, хотя steamcmd на клиенте им ещё пользовался: второй ПК
+# получал тот же логин и ловил Login Failure. 240 секунд = 16 пропущенных
+# ударов, при этом реально повисшая машина освобождает аккаунт за 4 минуты.
+LEASE_TIMEOUT_SEC = int(os.environ.get("STEAM_LEASE_TIMEOUT_SEC", "240"))
+
 # --- Логирование: консоль + файл с ротацией -------------------------------
 # Файл нужен, чтобы панель могла показывать хвост лога в браузере, а также чтобы
 # при закрытии консоли на Windows история ошибок не терялась.
@@ -56,22 +66,36 @@ def _lan_ip() -> str:
         s.close()
 
 
-def _cleanup_once() -> int:
-    """Синхронная функция очистки — запускается в потоке."""
+def _cleanup_once() -> list[tuple[int, str, int]]:
+    """Синхронная функция очистки — запускается в потоке.
+
+    Возвращает список (account_id, pc_id, секунд_без_heartbeat) — чтобы в логе
+    было видно, КАКОЙ ПК отвалился, а не просто счётчик.
+    """
     conn = get_conn()
     try:
-        cur = conn.execute(
-            "UPDATE accounts SET status='free', lease_token=NULL, leased_to_pc=NULL "
+        rows = conn.execute(
+            "SELECT id, leased_to_pc, (unixepoch() - last_heartbeat) AS silent "
+            "FROM accounts "
             "WHERE status='busy' AND last_heartbeat IS NOT NULL "
-            "AND (unixepoch() - last_heartbeat) > 90"
-        )
-        freed = cur.rowcount
+            "AND (unixepoch() - last_heartbeat) > ?",
+            (LEASE_TIMEOUT_SEC,)
+        ).fetchall()
+
+        if rows:
+            conn.execute(
+                "UPDATE accounts SET status='free', lease_token=NULL, leased_to_pc=NULL "
+                "WHERE status='busy' AND last_heartbeat IS NOT NULL "
+                "AND (unixepoch() - last_heartbeat) > ?",
+                (LEASE_TIMEOUT_SEC,)
+            )
+
         # Чистим устаревшие idempotency_keys старше суток
         conn.execute(
             "DELETE FROM idempotency_keys WHERE unixepoch() - created_at > 86400"
         )
         conn.commit()
-        return freed
+        return [(r["id"], r["leased_to_pc"] or "?", int(r["silent"] or 0)) for r in rows]
     finally:
         conn.close()
 
@@ -82,8 +106,11 @@ async def cleanup_stale_loop():
         await asyncio.sleep(60)
         try:
             freed = await asyncio.to_thread(_cleanup_once)
-            if freed:
-                logger.info("Освобождено %d зависших аккаунтов", freed)
+            for account_id, pc_id, silent in freed:
+                logger.warning(
+                    "Аренда освобождена: account_id=%s pc_id=%s (нет heartbeat %d с, лимит %d с)",
+                    account_id, pc_id, silent, LEASE_TIMEOUT_SEC
+                )
         except Exception:
             logger.exception("[cleanup] Ошибка")
 
@@ -103,6 +130,7 @@ async def lifespan(app: FastAPI):
     logger.info("  Лог-файл: %s", os.path.abspath(LOG_FILE))
     logger.info("  Логи клиентов: POST /logs/ingest -> %s",
                 os.path.abspath(os.environ.get("STEAM_CLIENT_LOG_DIR", "logs")))
+    logger.info("  Таймаут аренды: %d с без heartbeat", LEASE_TIMEOUT_SEC)
     logger.info("=" * 62)
 
     task = asyncio.create_task(cleanup_stale_loop())
@@ -141,4 +169,3 @@ if __name__ == "__main__":
 
     multiprocessing.freeze_support()
     uvicorn.run(app, host="0.0.0.0", port=8000, log_config=None)
-
