@@ -1,8 +1,19 @@
 // catalog.c - built-in catalog of free-to-play Steam apps
+//
+// size_hint is a rough download size in GB, used by the UI to warn before a
+// fresh install and to mark small titles that are handy for testing.
 #include <string.h>
 #include "catalog.h"
 
 static const F2PGame g_catalog[] = {
+    // ---- small F2P titles, good for a first end-to-end test (<= ~2 GB) ----
+    { "1782210", "Crab Game",              "Crab Game"                       },
+    { "291550",  "Brawlhalla",             "Brawlhalla"                      },
+    { "265630",  "Fistful of Frags",       "FistfulOfFrags"                  },
+    { "700330",  "SCP: Secret Laboratory", "SCP Secret Laboratory"           },
+    { "304930",  "Unturned",               "Unturned"                        },
+
+    // ---- main club titles ----
     { "730",     "Counter-Strike 2",       "Counter-Strike Global Offensive" },
     { "578080",  "PUBG: BATTLEGROUNDS",    "PUBG"                            },
     { "1172470", "Apex Legends",           "Apex Legends"                    },
@@ -22,6 +33,11 @@ static const F2PGame g_catalog[] = {
     { "1097150", "Fall Guys",              "Fall Guys"                       },
 };
 
+// App ids that are small enough to use as a smoke test (< ~4 GB).
+static const char *g_small_ids[] = {
+    "1782210", "291550", "265630", "700330", "304930",
+};
+
 const F2PGame *catalog_all(int *count) {
     if (count) *count = (int)(sizeof(g_catalog) / sizeof(g_catalog[0]));
     return g_catalog;
@@ -38,4 +54,13 @@ const F2PGame *catalog_find(const char *app_id) {
 
 int catalog_is_f2p(const char *app_id) {
     return catalog_find(app_id) != NULL;
+}
+
+int catalog_is_small(const char *app_id) {
+    if (!app_id || !app_id[0]) return 0;
+    int n = (int)(sizeof(g_small_ids) / sizeof(g_small_ids[0]));
+    for (int i = 0; i < n; i++) {
+        if (strcmp(g_small_ids[i], app_id) == 0) return 1;
+    }
+    return 0;
 }
