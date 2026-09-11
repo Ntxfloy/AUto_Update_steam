@@ -38,6 +38,11 @@ typedef struct {
     char  install_dir[MAX_PATH];    // force_install_dir target = the GAME folder
                                     // (library\steamapps\common\installdir)
     int   is_f2p;                   // 1 = send app_license_request
+    // 1 = append "validate" to app_update. This makes SteamCMD read every
+    // installed file from disk and hash it, which takes minutes on a big game.
+    // Only worth it for a broken/interrupted install or after a failure;
+    // a normal delta update does not need it.
+    int   validate;
     DWORD timeout_ms;               // max ms without output before abort (0 = no limit)
 
     SteamCmdProgressCb on_progress;
@@ -46,6 +51,33 @@ typedef struct {
     HANDLE             job_object;  // optional: Job Object to assign SteamCMD process to
     volatile int      *abort_flag;  // optional: set to non-zero to abort the run
 } SteamCmdJob;
+
+// One entry for the build-id query below.
+typedef struct {
+    char app_id[32];     // in
+    char buildid[32];    // out, empty if not reported
+} SteamCmdAppBuild;
+
+// Ask Valve for the CURRENT public-branch build id of one or more apps.
+//
+// Runs a single SteamCMD session:
+//   login <acc> -> app_info_update 1 -> app_info_print <id> ... -> quit
+// and parses "branches" { "public" { "buildid" "..." } } out of the output.
+// This is the same data the Steam client itself uses, so it is authoritative.
+//
+// One login covers the whole list, so checking 20 games costs one session
+// (~10-20 s) instead of 20 downloads-with-validate.
+//
+// Returns STEAMCMD_SUCCESS if the session ran and at least one build id was
+// parsed; the caller must still check each entry for an empty buildid.
+SteamCmdResult steamcmd_query_buildids(const char *steamcmd_path,
+                                       const char *login,
+                                       const char *password,
+                                       SteamCmdAppBuild *apps, int app_count,
+                                       DWORD timeout_ms,
+                                       SteamCmdLogCb on_log, void *userdata,
+                                       HANDLE job_object,
+                                       volatile int *abort_flag);
 
 // Run SteamCMD for one update job.
 // Blocks until SteamCMD exits or timeout.
