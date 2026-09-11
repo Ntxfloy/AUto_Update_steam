@@ -182,6 +182,32 @@ if "!NEEDS_WRITE!"=="1" (
     echo [+] updater.ini saved successfully!
 )
 
+rem 5. Desktop Shortcut
+set "DESKTOP_DIR=%USERPROFILE%\Desktop"
+for /f "usebackq delims=" %%D in (`powershell -NoProfile -ExecutionPolicy Bypass -Command "[Environment]::GetFolderPath('Desktop')" 2^>nul`) do (
+    if exist "%%D" set "DESKTOP_DIR=%%D"
+)
+set "SHORTCUT_FILE=!DESKTOP_DIR!\Steam Auto-Updater.lnk"
+set "ALT_SHORTCUT=!DESKTOP_DIR!\Steam Updater.lnk"
+
+if exist "!SHORTCUT_FILE!" (
+    echo [+] Desktop shortcut already exists: Steam Auto-Updater.lnk
+) else if exist "!ALT_SHORTCUT!" (
+    echo [+] Desktop shortcut already exists: Steam Updater.lnk
+) else (
+    echo [*] Creating Desktop shortcut...
+    powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+        "$ws = New-Object -ComObject WScript.Shell;" ^
+        "$s = $ws.CreateShortcut('!SHORTCUT_FILE!');" ^
+        "$s.TargetPath = '!CLIENT_EXE!';" ^
+        "$s.WorkingDirectory = '!TARGET_DIR!';" ^
+        "$s.Description = 'Steam Auto-Updater Client';" ^
+        "$s.Save();"
+    if exist "!SHORTCUT_FILE!" (
+        echo [+] Desktop shortcut created: Steam Auto-Updater.lnk
+    )
+)
+
 echo ===================================================
 echo   Setup Complete! Everything is ready in:
 echo   !TARGET_DIR!
@@ -191,3 +217,4 @@ if "!DO_RUN!"=="1" (
     echo [*] Launching Steam Auto-Updater...
     start "" /d "!TARGET_DIR!" "!CLIENT_EXE!"
 )
+
