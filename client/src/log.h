@@ -10,6 +10,7 @@
 //   * logging never blocks the worker: uploads happen on their own thread and
 //     a dead server only costs memory, not speed.
 #pragma once
+#include <stdarg.h>
 
 typedef enum {
     LOG_LEVEL_DEBUG = 0,
