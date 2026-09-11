@@ -3,6 +3,31 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
+// ---------------------------------------------------------------------------
+// StateFlags bits from appmanifest_<appid>.acf (Valve's AppState flags).
+// Only FILES_MISSING / FILES_CORRUPT justify a full validate pass; a plain
+// interrupted download (UPDATE_REQUIRED / UPDATE_STARTED / UPDATE_RUNNING)
+// is resumed by SteamCMD on its own without re-hashing the whole install.
+// ---------------------------------------------------------------------------
+#define ACF_STATE_UNINSTALLED      1
+#define ACF_STATE_UPDATE_REQUIRED  2
+#define ACF_STATE_FULLY_INSTALLED  4
+#define ACF_STATE_UPDATE_STARTED   8
+#define ACF_STATE_UPDATE_RUNNING   16
+#define ACF_STATE_UPDATE_PAUSED    32
+#define ACF_STATE_RECONFIGURING    64
+#define ACF_STATE_VALIDATING       128
+#define ACF_STATE_ADDING_FILES     256
+#define ACF_STATE_FILES_MISSING    512
+#define ACF_STATE_FILES_CORRUPT    1024
+
+// Result of acf_disk_check()
+#define ACF_DISK_OK         0   // fixed disk, not the Windows drive, >= 500 GB
+#define ACF_DISK_SYSTEM     1   // this is the Windows drive
+#define ACF_DISK_TOO_SMALL  2   // total capacity under 500 GB
+#define ACF_DISK_NOT_FIXED  3   // USB stick, card reader, DVD, network share, RAM disk
+#define ACF_DISK_UNUSABLE   4   // could not be queried at all
+
 // Parsed fields from an appmanifest_XXXX.acf file
 typedef struct {
     char appid[32];
@@ -28,14 +53,23 @@ int  acf_get_steam_root(char *out, int out_size);
 // Returns the number of roots written into roots[].
 int  acf_list_libraries(char roots[][MAX_PATH], int max_roots);
 
-// Pick the library with the most free space - used as install target for games
-// that are not installed yet. Returns 0 if no library was found.
+// Classify a path as an install target: drive type, system drive, capacity.
+// Returns one of ACF_DISK_*; out_total / out_free are filled with the volume
+// numbers whenever they could be read (pass NULL if not needed).
+int  acf_disk_check(const char *path, ULONGLONG *out_total, ULONGLONG *out_free);
+
+// Pick an eligible library with the most free space - used as install target
+// for games that are not installed yet. Applies the same policy as
+// acf_disk_check (no system drive, no removable media, >= 500 GB) and returns
+// 0 when nothing qualifies. It never falls back to the system disk.
 int  acf_pick_install_library(char *out, int out_size);
 
 // Copy the appmanifest SteamCMD generated (<steamcmd dir>\steamapps\
 // appmanifest_<appid>.acf) into the Steam client library and rewrite its
 // "installdir" field so the client sees the game as installed.
-// Returns 1 on success.
+// The swap is atomic: a temp file is written first and only moved over the
+// live manifest once it is complete, so a failure can never leave the game
+// without a manifest. Returns 1 on success.
 int  acf_import_manifest(const char *steamcmd_path, const char *app_id,
                          const char *target_library, const char *installdir);
 
