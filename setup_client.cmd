@@ -51,7 +51,7 @@ rem at least 3 GB free and take the first one in order of preference.
 rem If PowerShell is unavailable for any reason we fall back to the old logic.
 rem ---------------------------------------------------
 set "TARGET_DRIVE="
-for /f "usebackq delims=" %%D in (`powershell -NoProfile -ExecutionPolicy Bypass -Command "$pref=@('D:','E:','F:','G:','C:'); $fixed=Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' -ErrorAction SilentlyContinue; foreach($x in $pref){ $m=$fixed ^| Where-Object { $_.DeviceID -eq $x -and $_.FreeSpace -gt 3GB }; if($m){ Write-Output $x; break } }"`) do set "TARGET_DRIVE=%%D"
+for /f "usebackq delims=" %%D in (`powershell -NoProfile -ExecutionPolicy Bypass -Command "$p='D:','E:','F:','G:','C:'; foreach($x in $p){ $v=Get-CimInstance Win32_LogicalDisk -Filter ('DeviceID=''' + $x + ''' and DriveType=3'); if($v -and $v.FreeSpace -gt 3GB){ [Console]::Out.WriteLine($x); break } }"`) do set "TARGET_DRIVE=%%D"
 
 if not defined TARGET_DRIVE (
     echo [!] Could not query disks, falling back to the simple check.
