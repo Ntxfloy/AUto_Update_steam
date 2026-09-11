@@ -1,36 +1,38 @@
 // catalog.c - built-in catalog of free-to-play Steam apps
 //
-// size_hint is a rough download size in GB, used by the UI to warn before a
-// fresh install and to mark small titles that are handy for testing.
+// size_gb is a rough install size in GB. It is deliberately approximate: the
+// worker uses it only to make sure the target disk can hold the title (plus
+// 10% and 5 GB of air) and to warn before a fresh install. Exact numbers come
+// from the appmanifest once the game is on disk.
 #include <string.h>
 #include "catalog.h"
 
 static const F2PGame g_catalog[] = {
-    // ---- small F2P titles, good for a first end-to-end test (<= ~2 GB) ----
-    { "1782210", "Crab Game",              "Crab Game"                       },
-    { "291550",  "Brawlhalla",             "Brawlhalla"                      },
-    { "265630",  "Fistful of Frags",       "FistfulOfFrags"                  },
-    { "700330",  "SCP: Secret Laboratory", "SCP Secret Laboratory"           },
-    { "304930",  "Unturned",               "Unturned"                        },
+    // ---- small F2P titles, good for a first end-to-end test (<= ~4 GB) ----
+    { "1782210", "Crab Game",              "Crab Game",                        1 },
+    { "291550",  "Brawlhalla",             "Brawlhalla",                       2 },
+    { "265630",  "Fistful of Frags",       "FistfulOfFrags",                   2 },
+    { "700330",  "SCP: Secret Laboratory", "SCP Secret Laboratory",            2 },
+    { "304930",  "Unturned",               "Unturned",                         4 },
 
     // ---- main club titles ----
-    { "730",     "Counter-Strike 2",       "Counter-Strike Global Offensive" },
-    { "578080",  "PUBG: BATTLEGROUNDS",    "PUBG"                            },
-    { "1172470", "Apex Legends",           "Apex Legends"                    },
-    { "570",     "Dota 2",                 "dota 2 beta"                     },
-    { "440",     "Team Fortress 2",        "Team Fortress 2"                 },
-    { "1085660", "Destiny 2",              "Destiny 2"                       },
-    { "2073850", "THE FINALS",             "THE FINALS"                      },
-    { "1938090", "Call of Duty (Warzone)", "Call of Duty HQ"                 },
-    { "1203220", "NARAKA: BLADEPOINT",     "NARAKA BLADEPOINT"               },
-    { "230410",  "Warframe",               "Warframe"                        },
-    { "238960",  "Path of Exile",          "Path of Exile"                   },
-    { "2694490", "Path of Exile 2",        "Path of Exile 2"                 },
-    { "1599340", "Lost Ark",               "Lost Ark"                        },
-    { "236390",  "War Thunder",            "War Thunder"                     },
-    { "444090",  "Paladins",               "Paladins"                        },
-    { "218230",  "PlanetSide 2",           "PlanetSide 2"                    },
-    { "1097150", "Fall Guys",              "Fall Guys"                       },
+    { "730",     "Counter-Strike 2",       "Counter-Strike Global Offensive", 40 },
+    { "578080",  "PUBG: BATTLEGROUNDS",    "PUBG",                            50 },
+    { "1172470", "Apex Legends",           "Apex Legends",                    80 },
+    { "570",     "Dota 2",                 "dota 2 beta",                     75 },
+    { "440",     "Team Fortress 2",        "Team Fortress 2",                 25 },
+    { "1085660", "Destiny 2",              "Destiny 2",                      105 },
+    { "2073850", "THE FINALS",             "THE FINALS",                      35 },
+    { "1938090", "Call of Duty (Warzone)", "Call of Duty HQ",                120 },
+    { "1203220", "NARAKA: BLADEPOINT",     "NARAKA BLADEPOINT",               40 },
+    { "230410",  "Warframe",               "Warframe",                        60 },
+    { "238960",  "Path of Exile",          "Path of Exile",                   40 },
+    { "2694490", "Path of Exile 2",        "Path of Exile 2",                 60 },
+    { "1599340", "Lost Ark",               "Lost Ark",                       100 },
+    { "236390",  "War Thunder",            "War Thunder",                    100 },
+    { "444090",  "Paladins",               "Paladins",                        30 },
+    { "218230",  "PlanetSide 2",           "PlanetSide 2",                    20 },
+    { "1097150", "Fall Guys",              "Fall Guys",                       15 },
 };
 
 // App ids that are small enough to use as a smoke test (< ~4 GB).
@@ -63,4 +65,14 @@ int catalog_is_small(const char *app_id) {
         if (strcmp(g_small_ids[i], app_id) == 0) return 1;
     }
     return 0;
+}
+
+int catalog_size_gb(const char *app_id) {
+    const F2PGame *g = catalog_find(app_id);
+    return g ? g->size_gb : 0;
+}
+
+int catalog_is_huge(const char *app_id) {
+    const F2PGame *g = catalog_find(app_id);
+    return (g && g->size_gb >= CATALOG_HUGE_GB) ? 1 : 0;
 }
