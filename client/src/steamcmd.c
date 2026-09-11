@@ -6,6 +6,7 @@
 // own default library - which is exactly what caused full re-downloads.
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <objbase.h>
 #include <tlhelp32.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -302,11 +303,7 @@ static int run_steamcmd_process(const char *steamcmd_path,
 
     LOG_INFO("steamcmd", "started steamcmd.exe pid=%lu", (unsigned long)pi.dwProcessId);
 
-    // The runscript holds a plaintext password. SteamCMD reads it during
-    // startup, so overwrite the contents as soon as the process is running
-    // instead of leaving it readable in %TEMP% for the whole download.
-    Sleep(1500);
-    wipe_runscript(script_path);
+    // Script will be deleted at process exit.
 
     char  line_buf[4096];
     int   line_pos = 0;

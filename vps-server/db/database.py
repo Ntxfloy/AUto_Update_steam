@@ -5,8 +5,17 @@ import sqlite3
 import os
 from pathlib import Path
 
+import sys
+
 DB_PATH = os.environ.get("DB_PATH", "steam_club.db")
-SCHEMA_PATH = Path(__file__).parent / "schema.sql"
+
+if getattr(sys, "frozen", False):
+    _meipass = getattr(sys, "_MEIPASS", None)
+    SCHEMA_PATH = (Path(_meipass) / "db" / "schema.sql") if _meipass else (Path(sys.executable).parent / "db" / "schema.sql")
+    if not SCHEMA_PATH.exists():
+        SCHEMA_PATH = Path(sys.executable).parent / "db" / "schema.sql"
+else:
+    SCHEMA_PATH = Path(__file__).parent / "schema.sql"
 
 
 def get_conn() -> sqlite3.Connection:

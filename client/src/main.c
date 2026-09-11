@@ -7,6 +7,7 @@
 #include <windows.h>
 #include <commctrl.h>
 #include <commdlg.h>
+#include <uxtheme.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -54,30 +55,30 @@
 #define LOG_PROGRESS_THROTTLE_MS 2000
 
 // --- Layout ----------------------------------------------------------------
-#define PAD          24   // window margin
+#define PAD          20   // window margin
 #define CARD_PAD      8   // visible rounded frame around a control
-#define RIGHT_W     250   // button column width
-#define COL_GAP      22
-#define Y_PROGRESS  434
-#define Y_STATUS    478
-#define Y_QUEUE     500
-#define Y_LOG       538
+#define RIGHT_W     240   // button column width
+#define COL_GAP      18
+#define Y_PROGRESS  412
+#define Y_STATUS    454
+#define Y_QUEUE     478
+#define Y_LOG       506
 
 // ---------------------------------------------------------------------------
 // Dark palette
 // ---------------------------------------------------------------------------
-#define CLR_BG            RGB(24,  24,  27)
-#define CLR_PANEL         RGB(32,  32,  38)
-#define CLR_PANEL_ALT     RGB(40,  40,  47)
-#define CLR_BORDER        RGB(58,  58,  66)
-#define CLR_TEXT          RGB(233, 233, 238)
-#define CLR_TEXT_DIM      RGB(148, 148, 160)
-#define CLR_ACCENT        RGB(56,  120, 220)
-#define CLR_ACCENT_HOVER  RGB(78,  146, 246)
-#define CLR_ACCENT_DOWN   RGB(40,  96,  184)
-#define CLR_OK            RGB(64,  192, 112)
-#define CLR_FAIL          RGB(238, 92,  92)
-#define CLR_WARN          RGB(230, 176, 64)
+#define CLR_BG            RGB(18,  20,  26)
+#define CLR_PANEL         RGB(26,  29,  38)
+#define CLR_PANEL_ALT     RGB(34,  38,  49)
+#define CLR_BORDER        RGB(48,  54,  70)
+#define CLR_TEXT          RGB(240, 243, 250)
+#define CLR_TEXT_DIM      RGB(138, 145, 162)
+#define CLR_ACCENT        RGB(45,  115, 235)
+#define CLR_ACCENT_HOVER  RGB(65,  135, 255)
+#define CLR_ACCENT_DOWN   RGB(35,   95, 200)
+#define CLR_OK            RGB(52,  208, 122)
+#define CLR_FAIL          RGB(245,  85,  85)
+#define CLR_WARN          RGB(245, 185,  55)
 
 // Undocumented-but-stable DWM attribute for a dark title bar.
 // Loaded dynamically so the exe still starts on Windows 7/8.
@@ -132,7 +133,7 @@ static int           g_row_count           = 0;
 
 // Remembered checkbox selection (appids), loaded from selection.ini at start
 // and rewritten every time the operator ticks something.
-static char          g_sel_ids[MAX_ROWS][32] = 0;
+static char          g_sel_ids[MAX_ROWS][32] = {{0}};
 static int           g_sel_count             = 0;
 static int           g_sel_loaded            = 0;
 static int           g_sel_suppress          = 0;   // we are filling the list ourselves
@@ -270,7 +271,133 @@ static void SelectionSave(void) {
 // ---------------------------------------------------------------------------
 // Dark theming helpers
 // ---------------------------------------------------------------------------
+typedef HTHEME (WINAPI *fnOpenNcThemeData)(HWND hWnd, LPCWSTR pszClassList);
+static fnOpenNcThemeData g_pfnOpenNcThemeData = NULL;
+
+static HTHEME WINAPI MyOpenThemeData(HWND hWnd, LPCWSTR classList) {
+    if (classList && wcscmp(classList, L"ScrollBar") == 0) {
+        hWnd = NULL;
+        classList = L"Explorer::ScrollBar";
+    }
+    return g_pfnOpenNcThemeData(hWnd, classList);
+}
+
+typedef struct {
+    DWORD Attributes;
+    DWORD DllNameRVA;
+    DWORD ModuleHandleRVA;
+    DWORD ImportAddressTableRVA;
+    DWORD ImportNameTableRVA;
+    DWORD BoundImportAddressTableRVA;
+    DWORD UnloadInformationTableRVA;
+    DWORD TimeDateStamp;
+} ImgDelayDescr;
+
+static void FixDarkScrollBar(void) {
+    HMODULE hUxTheme = LoadLibraryA("uxtheme.dll");
+    if (!hUxTheme) return;
+
+    g_pfnOpenNcThemeData = (fnOpenNcThemeData)GetProcAddress(hUxTheme, MAKEINTRESOURCEA(49));
+    if (!g_pfnOpenNcThemeData) return;
+
+    HMODULE hComctl = LoadLibraryA("comctl32.dll");
+    if (!hComctl) return;
+
+    BYTE *base = (BYTE *)hComctl;
+    PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)base;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return;
+    PIMAGE_NT_HEADERS nt = (PIMAGE_NT_HEADERS)(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return;
+
+    IMAGE_DATA_DIRECTORY delayDir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT];
+    if (delayDir.VirtualAddress) {
+        ImgDelayDescr *desc = (ImgDelayDescr *)(base + delayDir.VirtualAddress);
+        for (; desc->DllNameRVA; ++desc) {
+            const char *dll = (const char *)(base + desc->DllNameRVA);
+            if (_stricmp(dll, "uxtheme.dll") == 0) {
+                PIMAGE_THUNK_DATA impName = (PIMAGE_THUNK_DATA)(base + desc->ImportNameTableRVA);
+                PIMAGE_THUNK_DATA impAddr = (PIMAGE_THUNK_DATA)(base + desc->ImportAddressTableRVA);
+                for (; impName->u1.Ordinal; ++impName, ++impAddr) {
+                    if (IMAGE_SNAP_BY_ORDINAL(impName->u1.Ordinal) && IMAGE_ORDINAL(impName->u1.Ordinal) == 49) {
+                        DWORD oldProt;
+                        if (VirtualProtect(impAddr, sizeof(IMAGE_THUNK_DATA), PAGE_READWRITE, &oldProt)) {
+                            impAddr->u1.Function = (ULONG_PTR)MyOpenThemeData;
+                            VirtualProtect(impAddr, sizeof(IMAGE_THUNK_DATA), oldProt, &oldProt);
+                        }
+                        break;
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    IMAGE_DATA_DIRECTORY impDir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (impDir.VirtualAddress) {
+        PIMAGE_IMPORT_DESCRIPTOR desc = (PIMAGE_IMPORT_DESCRIPTOR)(base + impDir.VirtualAddress);
+        for (; desc->Name; ++desc) {
+            const char *dll = (const char *)(base + desc->Name);
+            if (_stricmp(dll, "uxtheme.dll") == 0) {
+                PIMAGE_THUNK_DATA impName = (PIMAGE_THUNK_DATA)(base + desc->OriginalFirstThunk);
+                PIMAGE_THUNK_DATA impAddr = (PIMAGE_THUNK_DATA)(base + desc->FirstThunk);
+                for (; impName->u1.Ordinal; ++impName, ++impAddr) {
+                    if (IMAGE_SNAP_BY_ORDINAL(impName->u1.Ordinal) && IMAGE_ORDINAL(impName->u1.Ordinal) == 49) {
+                        DWORD oldProt;
+                        if (VirtualProtect(impAddr, sizeof(IMAGE_THUNK_DATA), PAGE_READWRITE, &oldProt)) {
+                            impAddr->u1.Function = (ULONG_PTR)MyOpenThemeData;
+                            VirtualProtect(impAddr, sizeof(IMAGE_THUNK_DATA), oldProt, &oldProt);
+                        }
+                        break;
+                    }
+                }
+                break;
+            }
+        }
+    }
+}
+
+typedef BOOL (WINAPI *fnAllowDarkModeForWindow)(HWND, BOOL);
+static fnAllowDarkModeForWindow g_pfnAllowDarkModeForWindow = NULL;
+
+static void init_app_dark_mode(void) {
+    HMODULE uxtheme = LoadLibraryA("uxtheme.dll");
+    if (uxtheme) {
+        typedef enum { Default = 0, AllowDark = 1, ForceDark = 2, ForceLight = 3, Max = 4 } PreferredAppMode;
+        typedef PreferredAppMode (WINAPI *fnSetPreferredAppMode)(PreferredAppMode);
+        fnSetPreferredAppMode set_mode = (fnSetPreferredAppMode)GetProcAddress(uxtheme, MAKEINTRESOURCEA(135));
+        if (set_mode) {
+            set_mode(ForceDark);
+        } else {
+            typedef BOOL (WINAPI *fnAllowDarkModeForApp)(BOOL);
+            fnAllowDarkModeForApp allow_app = (fnAllowDarkModeForApp)GetProcAddress(uxtheme, MAKEINTRESOURCEA(135));
+            if (allow_app) allow_app(TRUE);
+        }
+
+        typedef void (WINAPI *fnRefreshImmersiveColorPolicyState)(void);
+        fnRefreshImmersiveColorPolicyState refresh = (fnRefreshImmersiveColorPolicyState)GetProcAddress(uxtheme, MAKEINTRESOURCEA(104));
+        if (refresh) refresh();
+
+        typedef void (WINAPI *fnFlushMenuThemes)(void);
+        fnFlushMenuThemes flush = (fnFlushMenuThemes)GetProcAddress(uxtheme, MAKEINTRESOURCEA(136));
+        if (flush) flush();
+
+        g_pfnAllowDarkModeForWindow = (fnAllowDarkModeForWindow)GetProcAddress(uxtheme, MAKEINTRESOURCEA(133));
+    }
+
+    FixDarkScrollBar();
+}
+
+static void enable_dark_control(HWND ctl) {
+    if (!ctl) return;
+    if (g_pfnAllowDarkModeForWindow) g_pfnAllowDarkModeForWindow(ctl, TRUE);
+    if (FAILED(SetWindowTheme(ctl, L"DarkMode_Explorer", NULL)))
+        SetWindowTheme(ctl, L"Explorer", NULL);
+    SendMessageW(ctl, WM_THEMECHANGED, 0, 0);
+}
+
 static void enable_dark_titlebar(HWND hwnd) {
+    if (g_pfnAllowDarkModeForWindow) g_pfnAllowDarkModeForWindow(hwnd, TRUE);
+
     HMODULE dwm = LoadLibraryA("dwmapi.dll");
     if (!dwm) return;
     typedef HRESULT (WINAPI *SetAttrFn)(HWND, DWORD, LPCVOID, DWORD);
@@ -279,6 +406,10 @@ static void enable_dark_titlebar(HWND hwnd) {
         BOOL on = TRUE;
         if (FAILED(set_attr(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &on, sizeof(on))))
             set_attr(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE_OLD, &on, sizeof(on));
+
+        // Windows 11 rounded window corners (DWMWA_WINDOW_CORNER_PREFERENCE = 33, DWMWCP_ROUND = 2)
+        DWORD corner = 2;
+        set_attr(hwnd, 33, &corner, sizeof(corner));
     }
     FreeLibrary(dwm);
 }
@@ -308,6 +439,14 @@ static void paint_card(HDC dc, HWND parent, HWND child, int radius) {
 
 // --- Owner-drawn buttons: hover tracking via a tiny subclass ---------------
 static WNDPROC g_btn_oldproc = NULL;
+static WNDPROC g_progress_oldproc = NULL;
+
+static LRESULT CALLBACK ProgressSubProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    if (m == WM_WINDOWPOSCHANGED || m == WM_SIZE) {
+        InvalidateRect(h, NULL, TRUE);
+    }
+    return CallWindowProcA(g_progress_oldproc, h, m, w, l);
+}
 
 static LRESULT CALLBACK BtnSubProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     switch (m) {
@@ -440,6 +579,8 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow) {
         return 0;
     }
 
+    init_app_dark_mode();
+
     INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_LISTVIEW_CLASSES | ICC_PROGRESS_CLASS };
     InitCommonControlsEx(&icc);
 
@@ -509,6 +650,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow) {
     }
 
     WNDCLASSA wc = {0};
+    wc.style         = CS_HREDRAW | CS_VREDRAW;
     wc.lpfnWndProc   = WndProc;
     wc.hInstance     = hInst;
     wc.lpszClassName = "SteamAutoUpdater";
@@ -558,9 +700,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         PAINTSTRUCT ps;
         HDC dc = BeginPaint(hwnd, &ps);
         FillRect(dc, &ps.rcPaint, g_br_bg);
-        // Rounded cards behind the square common controls.
-        paint_card(dc, hwnd, g_list,    14);
-        paint_card(dc, hwnd, g_log_txt, 14);
         EndPaint(hwnd, &ps);
         return 0;
     }
@@ -576,7 +715,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_list = CreateWindowExA(0, WC_LISTVIEWA, "",
             WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | LVS_REPORT | LVS_SINGLESEL
             | LVS_SHOWSELALWAYS | LVS_NOSORTHEADER,
-            PAD, 60, 620, 344, hwnd, (HMENU)ID_LIST_GAMES, hi, NULL);
+            PAD, 54, 670, 320, hwnd, (HMENU)ID_LIST_GAMES, hi, NULL);
         ListView_SetExtendedListViewStyle(g_list,
             LVS_EX_CHECKBOXES | LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
         SendMessage(g_list, WM_SETFONT, (WPARAM)g_font_ui, TRUE);
@@ -590,30 +729,35 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_hdr_oldproc = (WNDPROC)SetWindowLongPtrA(hdr, GWLP_WNDPROC, (LONG_PTR)HeaderSubProc);
         }
 
+        // Col 0 is Game name so checkboxes are next to game title!
         LVCOLUMNA col = {0};
         col.mask = LVCF_TEXT | LVCF_WIDTH;
-        col.cx = 70;  col.pszText = (LPSTR)"AppID";   ListView_InsertColumn(g_list, 0, &col);
-        col.cx = 230; col.pszText = (LPSTR)"Game";    ListView_InsertColumn(g_list, 1, &col);
-        col.cx = 85;  col.pszText = (LPSTR)"Size";    ListView_InsertColumn(g_list, 2, &col);
-        col.cx = 90;  col.pszText = (LPSTR)"BuildID"; ListView_InsertColumn(g_list, 3, &col);
-        col.cx = 210; col.pszText = (LPSTR)"Status";  ListView_InsertColumn(g_list, 4, &col);
+        col.cx = 230; col.pszText = (LPSTR)"Game";    ListView_InsertColumn(g_list, 0, &col);
+        col.cx = 145; col.pszText = (LPSTR)"Status";  ListView_InsertColumn(g_list, 1, &col);
+        col.cx = 75;  col.pszText = (LPSTR)"Size";    ListView_InsertColumn(g_list, 2, &col);
+        col.cx = 85;  col.pszText = (LPSTR)"BuildID"; ListView_InsertColumn(g_list, 3, &col);
+        col.cx = 65;  col.pszText = (LPSTR)"AppID";   ListView_InsertColumn(g_list, 4, &col);
 
-        int bx = PAD + 620 + COL_GAP;
-        g_btn_update_all  = make_button(hwnd, "Update ALL checked",    ID_BTN_UPDATE_ALL,  bx, 60,  RIGHT_W, 44, 0);
-        g_btn_update      = make_button(hwnd, "Update selected",       ID_BTN_UPDATE,      bx, 114, RIGHT_W, 36, 0);
-        g_btn_check_all   = make_button(hwnd, "Select all",            ID_BTN_CHECK_ALL,   bx, 160, RIGHT_W, 34, 0);
-        g_btn_uncheck_all = make_button(hwnd, "Deselect all",          ID_BTN_UNCHECK_ALL, bx, 198, RIGHT_W, 34, 0);
-        g_btn_check_f2p   = make_button(hwnd, "Select all except PAID",ID_BTN_CHECK_F2P,   bx, 236, RIGHT_W, 34, 0);
-        g_btn_refresh     = make_button(hwnd, "Refresh list",          ID_BTN_REFRESH,     bx, 282, RIGHT_W, 34, 0);
-        g_btn_settings    = make_button(hwnd, "Settings",              ID_BTN_SETTINGS,    bx, 320, RIGHT_W, 34, 0);
-        g_btn_open_log    = make_button(hwnd, "Open debug log",        ID_BTN_OPEN_LOG,    bx, 358, RIGHT_W, 34, 0);
-        g_btn_abort       = make_button(hwnd, "Abort",                 ID_BTN_ABORT,       bx, 404, RIGHT_W, 36, 1);
+        enable_dark_control(g_list);
+
+        int bx = PAD + 670 + COL_GAP;
+        int bw = RIGHT_W;
+        g_btn_update_all  = make_button(hwnd, "Update ALL Checked",  ID_BTN_UPDATE_ALL,  bx, 54,  bw, 42, 0);
+        g_btn_update      = make_button(hwnd, "Update Selected",     ID_BTN_UPDATE,      bx, 104, bw, 32, 0);
+        g_btn_check_all   = make_button(hwnd, "Select All",          ID_BTN_CHECK_ALL,   bx, 142, bw, 28, 0);
+        g_btn_uncheck_all = make_button(hwnd, "Deselect All",        ID_BTN_UNCHECK_ALL, bx, 174, bw, 28, 0);
+        g_btn_check_f2p   = make_button(hwnd, "Select Free-to-Play", ID_BTN_CHECK_F2P,   bx, 206, bw, 28, 0);
+        g_btn_refresh     = make_button(hwnd, "Refresh List",        ID_BTN_REFRESH,     bx, 242, bw, 28, 0);
+        g_btn_settings    = make_button(hwnd, "Settings",            ID_BTN_SETTINGS,    bx, 274, bw, 28, 0);
+        g_btn_open_log    = make_button(hwnd, "Open Debug Log",      ID_BTN_OPEN_LOG,    bx, 306, bw, 28, 0);
+        g_btn_abort       = make_button(hwnd, "Stop / Abort",        ID_BTN_ABORT,       bx, 342, bw, 32, 1);
 
         // Our own progress bar: a static we paint ourselves, so it can be dark
         // and can show percentage, stage, bytes, speed and ETA inside the bar.
         g_progress = CreateWindowA("STATIC", "",
             WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | SS_OWNERDRAW,
-            PAD, Y_PROGRESS, 900, 34, hwnd, (HMENU)ID_PROGRESS, hi, NULL);
+            PAD, Y_PROGRESS, 928, 32, hwnd, (HMENU)ID_PROGRESS, hi, NULL);
+        g_progress_oldproc = (WNDPROC)SetWindowLongPtrA(g_progress, GWLP_WNDPROC, (LONG_PTR)ProgressSubProc);
 
         g_status_txt = CreateWindowA("STATIC", "Idle",
             WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | SS_LEFT | SS_ENDELLIPSIS,
@@ -628,9 +772,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_log_txt = CreateWindowExA(0, "EDIT", "",
             WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_VSCROLL
             | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
-            PAD, Y_LOG, 900, 250, hwnd, (HMENU)ID_LOG_TEXT, hi, NULL);
+            PAD, Y_LOG, 928, 250, hwnd, (HMENU)ID_LOG_TEXT, hi, NULL);
         SendMessage(g_log_txt, EM_SETLIMITTEXT, 262144, 0);
         SendMessage(g_log_txt, WM_SETFONT, (WPARAM)g_font_mono, TRUE);
+        enable_dark_control(g_log_txt);
 
         ProgressReset();
         DrawProgress(0.0, "idle", 0, 0);
@@ -699,20 +844,23 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         DRAWITEMSTRUCT *di = (DRAWITEMSTRUCT *)lp;
 
         if (di->CtlID == ID_PROGRESS) {
-            RECT rc = di->rcItem;
-            fill_round(di->hDC, rc, CLR_PANEL, CLR_BORDER, 14);
+            RECT rc;
+            GetClientRect(di->hwndItem, &rc);
+            FillRect(di->hDC, &rc, g_br_bg);
+            fill_round(di->hDC, rc, CLR_PANEL, CLR_BORDER, 10);
 
             double p = g_pct;
             if (p < 0.0)   p = 0.0;
             if (p > 100.0) p = 100.0;
             int track = rc.right - rc.left - 6;
             int w = (int)(track * (p / 100.0));
+            if (w > track) w = track;
             if (w > 4) {
                 RECT fr = { rc.left + 3, rc.top + 3, rc.left + 3 + w, rc.bottom - 3 };
                 COLORREF c = g_pct_failed ? CLR_FAIL
                            : g_pct_warn   ? CLR_WARN
                            : (p >= 99.999 ? CLR_OK : CLR_ACCENT);
-                fill_round(di->hDC, fr, c, c, 12);
+                fill_round(di->hDC, fr, c, c, 8);
             }
 
             SetBkMode(di->hDC, TRANSPARENT);
@@ -725,6 +873,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
 
         if (di->CtlType == ODT_BUTTON) {
+            RECT rc;
+            GetClientRect(di->hwndItem, &rc);
+            FillRect(di->hDC, &rc, g_br_bg);
+
             int hovered  = (int)GetWindowLongPtrA(di->hwndItem, GWLP_USERDATA);
             int pressed  = (di->itemState & ODS_SELECTED) ? 1 : 0;
             int disabled = (di->itemState & ODS_DISABLED) ? 1 : 0;
@@ -748,14 +900,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 text   = hovered || pressed ? RGB(255, 255, 255) : CLR_FAIL;
             }
 
-            fill_round(di->hDC, di->rcItem, fill, border, 14);
+            fill_round(di->hDC, rc, fill, border, 10);
 
             char txt[128] = {0};
             GetWindowTextA(di->hwndItem, txt, sizeof(txt) - 1);
             SetBkMode(di->hDC, TRANSPARENT);
             SetTextColor(di->hDC, text);
             HFONT of = (HFONT)SelectObject(di->hDC, g_font_ui);
-            DrawTextA(di->hDC, txt, -1, &di->rcItem,
+            DrawTextA(di->hDC, txt, -1, &rc,
                       DT_CENTER | DT_VCENTER | DT_SINGLELINE);
             SelectObject(di->hDC, of);
             return TRUE;
@@ -791,16 +943,27 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             case CDDS_ITEMPREPAINT | CDDS_SUBITEM: {
                 int row = (int)cd->nmcd.dwItemSpec;
                 cd->clrTextBk = (row % 2) ? CLR_PANEL_ALT : CLR_PANEL;
-                if (cd->iSubItem == 4 && row >= 0 && row < g_row_count) {
+                if (cd->iSubItem == 1 && row >= 0 && row < g_row_count) {
+                    // Status column
                     switch (g_rows[row].result) {
                     case 1:  cd->clrText = CLR_OK;   break;
                     case 2:  cd->clrText = CLR_FAIL; break;
                     case 3:  cd->clrText = CLR_WARN; break;
-                    default: cd->clrText = g_rows[row].installed ? CLR_TEXT : CLR_TEXT_DIM;
+                    default:
+                        if (strstr(g_rows[row].status, "Installed"))
+                            cd->clrText = RGB(65, 205, 125);
+                        else if (strstr(g_rows[row].status, "Working") || strstr(g_rows[row].status, "Updating"))
+                            cd->clrText = CLR_ACCENT_HOVER;
+                        else
+                            cd->clrText = CLR_TEXT_DIM;
+                        break;
                     }
+                } else if (cd->iSubItem == 0 && row >= 0 && row < g_row_count) {
+                    // Game column
+                    cd->clrText = g_rows[row].installed ? CLR_TEXT : CLR_TEXT_DIM;
                 } else {
-                    cd->clrText = (row >= 0 && row < g_row_count && !g_rows[row].installed)
-                                  ? CLR_TEXT_DIM : CLR_TEXT;
+                    // Other columns (Size, BuildID, AppID)
+                    cd->clrText = CLR_TEXT_DIM;
                 }
                 return CDRF_NEWFONT;
             }
@@ -967,32 +1130,37 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             int full_w = w - PAD * 2;
 
             MoveWindow(g_title_txt,       PAD, 14, list_w, 28, TRUE);
-            MoveWindow(g_list,            PAD, 60, list_w, 344, TRUE);
-            MoveWindow(g_btn_update_all,  bx, 60,  RIGHT_W, 44, TRUE);
-            MoveWindow(g_btn_update,      bx, 114, RIGHT_W, 36, TRUE);
-            MoveWindow(g_btn_check_all,   bx, 160, RIGHT_W, 34, TRUE);
-            MoveWindow(g_btn_uncheck_all, bx, 198, RIGHT_W, 34, TRUE);
-            MoveWindow(g_btn_check_f2p,   bx, 236, RIGHT_W, 34, TRUE);
-            MoveWindow(g_btn_refresh,     bx, 282, RIGHT_W, 34, TRUE);
-            MoveWindow(g_btn_settings,    bx, 320, RIGHT_W, 34, TRUE);
-            MoveWindow(g_btn_open_log,    bx, 358, RIGHT_W, 34, TRUE);
-            MoveWindow(g_btn_abort,       bx, 404, RIGHT_W, 36, TRUE);
-            MoveWindow(g_progress,   PAD, Y_PROGRESS, full_w, 34, TRUE);
+            MoveWindow(g_list,            PAD, 54, list_w, 320, TRUE);
+            int other_cols = 145 + 75 + 85 + 65;
+            int game_w = list_w - other_cols - 25;
+            if (game_w > 120) ListView_SetColumnWidth(g_list, 0, game_w);
+
+            MoveWindow(g_btn_update_all,  bx, 54,  RIGHT_W, 42, TRUE);
+            MoveWindow(g_btn_update,      bx, 104, RIGHT_W, 32, TRUE);
+            MoveWindow(g_btn_check_all,   bx, 142, RIGHT_W, 28, TRUE);
+            MoveWindow(g_btn_uncheck_all, bx, 174, RIGHT_W, 28, TRUE);
+            MoveWindow(g_btn_check_f2p,   bx, 206, RIGHT_W, 28, TRUE);
+            MoveWindow(g_btn_refresh,     bx, 242, RIGHT_W, 28, TRUE);
+            MoveWindow(g_btn_settings,    bx, 274, RIGHT_W, 28, TRUE);
+            MoveWindow(g_btn_open_log,    bx, 306, RIGHT_W, 28, TRUE);
+            MoveWindow(g_btn_abort,       bx, 342, RIGHT_W, 32, TRUE);
+            MoveWindow(g_progress,   PAD, Y_PROGRESS, full_w, 32, TRUE);
             MoveWindow(g_status_txt, PAD, Y_STATUS,   full_w, 20, TRUE);
             MoveWindow(g_queue_txt,  PAD, Y_QUEUE,    full_w, 20, TRUE);
-            MoveWindow(g_log_txt,    PAD, Y_LOG, full_w,
-                       h > Y_LOG + 80 ? h - Y_LOG - PAD - CARD_PAD : 40, TRUE);
-            // The cards are painted by the parent, so the whole frame must be
-            // redrawn after a resize or the old rounded outlines stay behind.
-            InvalidateRect(hwnd, NULL, FALSE);
+            MoveWindow(g_log_txt,    PAD, Y_LOG,      full_w,
+                       h > Y_LOG + 60 ? h - Y_LOG - PAD : 40, TRUE);
+            RedrawWindow(g_progress, NULL, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW);
+            InvalidateRect(g_status_txt, NULL, TRUE);
+            InvalidateRect(g_queue_txt, NULL, TRUE);
+            InvalidateRect(hwnd, NULL, TRUE);
         }
         break;
     }
 
     case WM_GETMINMAXINFO: {
         MINMAXINFO *mmi = (MINMAXINFO *)lp;
-        mmi->ptMinTrackSize.x = 920;
-        mmi->ptMinTrackSize.y = 740;
+        mmi->ptMinTrackSize.x = 900;
+        mmi->ptMinTrackSize.y = 700;
         break;
     }
 
@@ -1050,7 +1218,7 @@ static void DrawProgress(double pct, const char *label, int failed, int warn) {
     strncpy(g_pct_label, newlabel, sizeof(g_pct_label) - 1);
     g_pct_label[sizeof(g_pct_label) - 1] = '\0';
 
-    if (changed && g_progress) InvalidateRect(g_progress, NULL, FALSE);
+    if (changed && g_progress) InvalidateRect(g_progress, NULL, TRUE);
 }
 
 static void ProgressReset(void) {
@@ -1240,12 +1408,12 @@ static void RefreshGameList(void) {
         LVITEMA item = {0};
         item.mask    = LVIF_TEXT;
         item.iItem   = i;
-        item.pszText = g_rows[i].appid;
+        item.pszText = g_rows[i].name;
         ListView_InsertItem(g_list, &item);
-        ListView_SetItemText(g_list, i, 1, g_rows[i].name);
+        ListView_SetItemText(g_list, i, 1, g_rows[i].status);
         ListView_SetItemText(g_list, i, 2, g_rows[i].size);
         ListView_SetItemText(g_list, i, 3, g_rows[i].buildid);
-        ListView_SetItemText(g_list, i, 4, g_rows[i].status);
+        ListView_SetItemText(g_list, i, 4, g_rows[i].appid);
         // Restore the operator's last choice; only fall back to "installed
         // free-to-play games" the very first time this PC runs the updater.
         int checked = g_sel_loaded
@@ -1355,7 +1523,7 @@ static int StartRow(int row_idx) {
     strncpy(g_rows[row_idx].status, g_rows[row_idx].installed ? "Updating..." : "Installing...",
             sizeof(g_rows[row_idx].status)-1);
     g_rows[row_idx].result = 3;
-    ListView_SetItemText(g_list, row_idx, 4, g_rows[row_idx].status);
+    ListView_SetItemText(g_list, row_idx, 1, g_rows[row_idx].status);
     ListView_EnsureVisible(g_list, row_idx, FALSE);
 
     g_current_row = row_idx;
@@ -1369,7 +1537,7 @@ static int StartRow(int row_idx) {
         g_fail_count++;
         strncpy(g_rows[row_idx].status, "FAILED: thread", sizeof(g_rows[row_idx].status)-1);
         g_rows[row_idx].result = 2;
-        ListView_SetItemText(g_list, row_idx, 4, g_rows[row_idx].status);
+        ListView_SetItemText(g_list, row_idx, 1, g_rows[row_idx].status);
         return 0;
     }
     return 1;
@@ -1496,7 +1664,7 @@ static void UpdateUIFromWorker(void) {
             LOG_ERROR("ui", "row failed: app %s: %s",
                       g_rows[g_current_row].appid, errmsg[0] ? errmsg : "unknown");
         }
-        ListView_SetItemText(g_list, g_current_row, 4, g_rows[g_current_row].status);
+        ListView_SetItemText(g_list, g_current_row, 1, g_rows[g_current_row].status);
     }
 
     if (hWorker) CloseHandle(hWorker);
@@ -1527,8 +1695,8 @@ static void UpdateUIFromWorker(void) {
     // Refresh sizes / build ids so the list matches reality after the run.
     RefreshGameList();
 
-    MessageBoxA(g_hwnd, summary, "Update finished",
-                MB_OK | (g_fail_count ? MB_ICONWARNING : MB_ICONINFORMATION));
+    // Flash taskbar to gently notify operator without ugly white popup
+    FlashWindow(g_hwnd, TRUE);
 }
 
 // ---------------------------------------------------------------------------

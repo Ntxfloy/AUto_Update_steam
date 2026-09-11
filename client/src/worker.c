@@ -269,14 +269,15 @@ static DWORD WINAPI worker_thread(LPVOID arg) {
         strncpy(g_status->build_id_before, acf.buildid, 31);
         LeaveCriticalSection(&g_status->lock);
 
+        int flags = atoi(acf.state_flags);
         LOG_INFO("worker", "installed: %s | buildid %s | stateflags %d | %.1f GB",
-                 game_path, acf.buildid, acf.state_flags,
-                 (double)acf.size_on_disk / 1e9);
+                 game_path, acf.buildid, flags,
+                 atof(acf.size_on_disk) / 1e9);
 
-        if (acf.state_flags != ACF_STATE_FULLY_INSTALLED) {
+        if (flags != ACF_STATE_FULLY_INSTALLED) {
             validate_needed = 1;
             say("Previous install was interrupted (StateFlags=%d) - a file check is required.",
-                acf.state_flags);
+                flags);
         }
 
         if (!acf_backup(&acf, backup_path)) backup_path[0] = '\0';  // non-fatal

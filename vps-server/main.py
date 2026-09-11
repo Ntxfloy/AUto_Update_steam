@@ -133,3 +133,12 @@ def health():
         return {"status": "ok"}
     except Exception:
         return JSONResponse(status_code=503, content={"status": "error"})
+
+
+if __name__ == "__main__":
+    import multiprocessing
+    import uvicorn
+
+    multiprocessing.freeze_support()
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_config=None)
+

@@ -263,11 +263,46 @@ int acf_import_manifest(const char *steamcmd_path, const char *app_id,
     dir[MAX_PATH - 1] = '\0';
     char *slash = strrchr(dir, '\\');
     if (!slash) slash = strrchr(dir, '/');
-    if (!slash) return 0;
-    *slash = '\0';
+    if (slash) *slash = '\0';
 
-    char src[MAX_PATH];
-    snprintf(src, MAX_PATH, "%s\\steamapps\\appmanifest_%s.acf", dir, app_id);
+    char src[MAX_PATH] = {0};
+    char cand[MAX_PATH];
+
+    // 1. SteamCMD puts the manifest here when force_install_dir is used:
+    // <target_library>\steamapps\common\<installdir>\steamapps\appmanifest_<app_id>.acf
+    snprintf(cand, MAX_PATH, "%s\\steamapps\\common\\%s\\steamapps\\appmanifest_%s.acf",
+             target_library, installdir, app_id);
+    if (GetFileAttributesA(cand) != INVALID_FILE_ATTRIBUTES) {
+        strncpy(src, cand, MAX_PATH - 1);
+    }
+
+    // 2. Or directly in the game folder:
+    if (!src[0]) {
+        snprintf(cand, MAX_PATH, "%s\\steamapps\\common\\%s\\appmanifest_%s.acf",
+                 target_library, installdir, app_id);
+        if (GetFileAttributesA(cand) != INVALID_FILE_ATTRIBUTES) {
+            strncpy(src, cand, MAX_PATH - 1);
+        }
+    }
+
+    // 3. Or in steamcmd directory (if force_install_dir was not used):
+    if (!src[0] && dir[0]) {
+        snprintf(cand, MAX_PATH, "%s\\steamapps\\appmanifest_%s.acf", dir, app_id);
+        if (GetFileAttributesA(cand) != INVALID_FILE_ATTRIBUTES) {
+            strncpy(src, cand, MAX_PATH - 1);
+        }
+    }
+
+    // 4. Or already in the target library:
+    if (!src[0]) {
+        snprintf(cand, MAX_PATH, "%s\\steamapps\\appmanifest_%s.acf", target_library, app_id);
+        if (GetFileAttributesA(cand) != INVALID_FILE_ATTRIBUTES) {
+            strncpy(src, cand, MAX_PATH - 1);
+        }
+    }
+
+    if (!src[0]) return 0;
+
     char *buf = read_file_alloc(src);
     if (!buf) return 0;
 
@@ -278,35 +313,41 @@ int acf_import_manifest(const char *steamcmd_path, const char *app_id,
     char dst[MAX_PATH];
     snprintf(dst, MAX_PATH, "%s\\appmanifest_%s.acf", dst_dir, app_id);
 
-    HANDLE h = CreateFileA(dst, GENERIC_WRITE, 0, NULL,
-                           CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (h == INVALID_HANDLE_VALUE) {
-        HeapFree(GetProcessHeap(), 0, buf);
-        return 0;
-    }
-
-    DWORD written = 0;
-    char *p = buf;
-    while (*p) {
-        char *eol = strchr(p, '\n');
-        size_t len = eol ? (size_t)(eol - p) + 1 : strlen(p);
-
-        char tmp[1024];
-        size_t cl = len < sizeof(tmp) - 1 ? len : sizeof(tmp) - 1;
-        memcpy(tmp, p, cl);
-        tmp[cl] = '\0';
-
-        if (strstr(tmp, "\"installdir\"")) {
-            char out_line[1024];
-            snprintf(out_line, sizeof(out_line), "\t\"installdir\"\t\t\"%s\"\r\n", installdir);
-            WriteFile(h, out_line, (DWORD)strlen(out_line), &written, NULL);
-        } else {
-            WriteFile(h, p, (DWORD)len, &written, NULL);
+    // If source is different from destination, copy and ensure installdir is set
+    if (_stricmp(src, dst) != 0) {
+        HANDLE h = CreateFileA(dst, GENERIC_WRITE, 0, NULL,
+                               CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (h == INVALID_HANDLE_VALUE) {
+            HeapFree(GetProcessHeap(), 0, buf);
+            return 0;
         }
-        p += len;
+
+        DWORD written = 0;
+        char *p = buf;
+        while (*p) {
+            char *eol = strchr(p, '\n');
+            size_t len = eol ? (size_t)(eol - p) + 1 : strlen(p);
+
+            char tmp[1024];
+            size_t cl = len < sizeof(tmp) - 1 ? len : sizeof(tmp) - 1;
+            memcpy(tmp, p, cl);
+            tmp[cl] = '\0';
+
+            if (strstr(tmp, "\"installdir\"")) {
+                char out_line[1024];
+                snprintf(out_line, sizeof(out_line), "\t\"installdir\"\t\t\"%s\"\r\n", installdir);
+                WriteFile(h, out_line, (DWORD)strlen(out_line), &written, NULL);
+            } else {
+                WriteFile(h, p, (DWORD)len, &written, NULL);
+            }
+            p += len;
+        }
+
+        CloseHandle(h);
+        // Clean up temporary src file
+        DeleteFileA(src);
     }
 
-    CloseHandle(h);
     HeapFree(GetProcessHeap(), 0, buf);
     return 1;
 }

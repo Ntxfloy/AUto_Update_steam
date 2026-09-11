@@ -27,7 +27,16 @@ from routers.deps import verify_api_key
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
+import sys
+
+if getattr(sys, "frozen", False):
+    _meipass = getattr(sys, "_MEIPASS", None)
+    STATIC_DIR = (Path(_meipass) / "static") if _meipass else (Path(sys.executable).parent / "static")
+    if not STATIC_DIR.exists():
+        STATIC_DIR = Path(sys.executable).parent / "static"
+else:
+    STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
+
 LOG_FILE = Path(os.environ.get("STEAM_LOG_FILE", "server.log"))
 
 VALID_STATUSES = ("free", "busy", "bad", "disabled")

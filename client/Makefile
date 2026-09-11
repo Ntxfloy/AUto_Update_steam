@@ -17,7 +17,7 @@ SRCS = $(SRC_DIR)/main.c \
        $(SRC_DIR)/worker.c
 
 CFLAGS  = -Wall -Wextra -O2 -DWINVER=0x0601 -D_WIN32_WINNT=0x0601
-LDFLAGS = -mwindows -lwinhttp -lole32 -lcomctl32 -lcomdlg32 -lgdi32 -luser32
+LDFLAGS = -mwindows -lwinhttp -lole32 -lcomctl32 -lcomdlg32 -lgdi32 -luser32 -luxtheme -ldwmapi
 
 all: $(TARGET)
 

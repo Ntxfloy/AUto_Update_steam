@@ -16,6 +16,17 @@ __pycache__/
 *.pyc
 *.pyo
 vps-server/steam_club.db
+.venv/
+vps-server/.venv/
+vps-server/build/
+vps-server/dist/
+vps-server/server.spec
+
+# Logs & user state
+*.log
+client_build/*.log
+client_build/selection.ini
+selection.ini
 
 # Temp
 accounts_tmp.py
