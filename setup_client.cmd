@@ -41,13 +41,24 @@ echo   Steam Auto-Updater - Client Auto-Setup
 echo   Target Server: !SERVER_URL!
 echo ===================================================
 
-rem 1. Choose Target Drive (Prefer D:, fallback to C:)
-if exist "D:\" (
-    set "TARGET_DIR=D:\SteamUpdater"
-) else (
-    set "TARGET_DIR=C:\SteamUpdater"
+rem ---------------------------------------------------
+rem 1. Choose the target drive
+rem
+rem "if exist D:\" was not enough: D: can be a DVD drive, a card reader or a
+rem mounted USB stick on some machines, and then the whole updater would land
+rem on removable media. We ask Windows for real fixed disks (DriveType=3) with
+rem at least 3 GB free and take the first one in order of preference.
+rem If PowerShell is unavailable for any reason we fall back to the old logic.
+rem ---------------------------------------------------
+set "TARGET_DRIVE="
+for /f "usebackq delims=" %%D in (`powershell -NoProfile -ExecutionPolicy Bypass -Command "$pref=@('D:','E:','F:','G:','C:'); $fixed=Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' -ErrorAction SilentlyContinue; foreach($x in $pref){ $m=$fixed ^| Where-Object { $_.DeviceID -eq $x -and $_.FreeSpace -gt 3GB }; if($m){ Write-Output $x; break } }"`) do set "TARGET_DRIVE=%%D"
+
+if not defined TARGET_DRIVE (
+    echo [!] Could not query disks, falling back to the simple check.
+    if exist "D:\" ( set "TARGET_DRIVE=D:" ) else ( set "TARGET_DRIVE=C:" )
 )
 
+set "TARGET_DIR=!TARGET_DRIVE!\SteamUpdater"
 if not exist "!TARGET_DIR!" mkdir "!TARGET_DIR!"
 echo [*] Target folder: !TARGET_DIR!
 
@@ -80,6 +91,8 @@ if not defined STEAMCMD_EXE (
     )
 )
 
+set "STEAMCMD_FRESH=0"
+
 if not defined STEAMCMD_EXE (
     echo [*] steamcmd.exe not found. Downloading official SteamCMD portable...
     set "STEAMCMD_DIR=!TARGET_DIR!\steamcmd"
@@ -95,6 +108,7 @@ if not defined STEAMCMD_EXE (
 
     if exist "!STEAMCMD_DIR!\steamcmd.exe" (
         set "STEAMCMD_EXE=!STEAMCMD_DIR!\steamcmd.exe"
+        set "STEAMCMD_FRESH=1"
         echo [+] SteamCMD ready: !STEAMCMD_EXE!
     ) else (
         echo [!] Warning: Could not download steamcmd automatically.
@@ -131,7 +145,14 @@ if exist "!CLIENT_EXE!" (
     )
 )
 
+rem ---------------------------------------------------
 rem 4. Check, Create or Update updater.ini
+rem
+rem The parser now tolerates "key = value" with spaces around the '=' and
+rem ignores comment / section lines, so a hand-edited ini is not silently
+rem misread (that used to produce keys like "server_url " that matched
+rem nothing, and the file was rewritten on every run).
+rem ---------------------------------------------------
 set "INI_FILE=!TARGET_DIR!\updater.ini"
 set "CURRENT_URL="
 set "CURRENT_PC_ID="
@@ -139,19 +160,51 @@ set "CURRENT_KEY="
 set "CURRENT_STEAMCMD="
 
 if exist "!INI_FILE!" (
-    for /f "tokens=1,* delims==" %%A in ('type "!INI_FILE!" 2^>nul') do (
+    for /f "usebackq tokens=1,* delims==" %%A in ("!INI_FILE!") do (
         set "KEY_NAME=%%A"
         set "VAL=%%B"
-        if /i "!KEY_NAME!"=="server_url" set "CURRENT_URL=!VAL!"
-        if /i "!KEY_NAME!"=="pc_id" set "CURRENT_PC_ID=!VAL!"
-        if /i "!KEY_NAME!"=="api_key" set "CURRENT_KEY=!VAL!"
-        if /i "!KEY_NAME!"=="steamcmd_path" set "CURRENT_STEAMCMD=!VAL!"
+
+        rem key: drop every space, so " server_url " -> "server_url"
+        set "KEY_NAME=!KEY_NAME: =!"
+        set "KEY_NAME=!KEY_NAME:	ab=!"
+
+        rem skip comments and [sections]
+        set "SKIP=0"
+        if "!KEY_NAME!"==""           set "SKIP=1"
+        if "!KEY_NAME:~0,1!"==";"     set "SKIP=1"
+        if "!KEY_NAME:~0,1!"=="#"     set "SKIP=1"
+        if "!KEY_NAME:~0,1!"=="["     set "SKIP=1"
+
+        if "!SKIP!"=="0" if defined VAL (
+            rem value: trim leading spaces, then trailing spaces (paths may
+            rem contain inner spaces, so only the edges are touched)
+            for /f "tokens=* delims= " %%X in ("!VAL!") do set "VAL=%%X"
+            if defined VAL if "!VAL:~-1!"==" " set "VAL=!VAL:~0,-1!"
+            if defined VAL if "!VAL:~-1!"==" " set "VAL=!VAL:~0,-1!"
+            if defined VAL if "!VAL:~-1!"==" " set "VAL=!VAL:~0,-1!"
+
+            if /i "!KEY_NAME!"=="server_url"    set "CURRENT_URL=!VAL!"
+            if /i "!KEY_NAME!"=="pc_id"         set "CURRENT_PC_ID=!VAL!"
+            if /i "!KEY_NAME!"=="api_key"       set "CURRENT_KEY=!VAL!"
+            if /i "!KEY_NAME!"=="steamcmd_path" set "CURRENT_STEAMCMD=!VAL!"
+        )
     )
 )
 
 if not defined CURRENT_PC_ID set "CURRENT_PC_ID=%COMPUTERNAME%"
 if not defined CURRENT_STEAMCMD set "CURRENT_STEAMCMD=!STEAMCMD_EXE!"
 if not defined STEAMCMD_EXE set "STEAMCMD_EXE=!CURRENT_STEAMCMD!"
+
+rem If the remembered steamcmd path no longer exists, prefer the one we found
+rem now - otherwise the client keeps pointing at a deleted folder.
+if defined CURRENT_STEAMCMD (
+    if not exist "!CURRENT_STEAMCMD!" (
+        if defined STEAMCMD_EXE if exist "!STEAMCMD_EXE!" (
+            echo [*] Stored steamcmd path is gone, using !STEAMCMD_EXE!
+            set "CURRENT_STEAMCMD=!STEAMCMD_EXE!"
+        )
+    )
+)
 
 set "NEEDS_WRITE=0"
 if not exist "!INI_FILE!" (
@@ -166,6 +219,9 @@ if not exist "!INI_FILE!" (
 ) else if not "!CURRENT_KEY!"=="!API_KEY!" (
     set "NEEDS_WRITE=1"
     echo [*] API Key changed, updating updater.ini...
+) else if not "!CURRENT_STEAMCMD!"=="!STEAMCMD_EXE!" (
+    set "NEEDS_WRITE=1"
+    echo [*] SteamCMD path changed, updating updater.ini...
 ) else (
     echo [+] updater.ini is up to date: !CURRENT_URL! [PC: !CURRENT_PC_ID!]
 )
@@ -176,7 +232,7 @@ if "!NEEDS_WRITE!"=="1" (
         echo [AutoUpdater]
         echo server_url=!SERVER_URL!
         echo api_key=!API_KEY!
-        echo steamcmd_path=!STEAMCMD_EXE!
+        echo steamcmd_path=!CURRENT_STEAMCMD!
         echo pc_id=!CURRENT_PC_ID!
     ) > "!INI_FILE!"
     echo [+] updater.ini saved successfully!
@@ -220,6 +276,21 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
     "    }" ^
     "}"
 
+rem ---------------------------------------------------
+rem 6. Warm up a freshly downloaded SteamCMD
+rem
+rem The very first steamcmd start downloads its own runtime (1-2 minutes).
+rem Without this the wait happens inside the first update session and looks
+rem exactly like a hang with no progress.
+rem ---------------------------------------------------
+if "!STEAMCMD_FRESH!"=="1" (
+    if exist "!STEAMCMD_EXE!" (
+        echo [*] Warming up SteamCMD ^(first run self-update, 1-2 min^)...
+        "!STEAMCMD_EXE!" +quit >nul 2>&1
+        echo [+] SteamCMD warm-up done.
+    )
+)
+
 echo ===================================================
 echo   Setup Complete! Everything is ready in:
 echo   !TARGET_DIR!
@@ -229,5 +300,3 @@ if "!DO_RUN!"=="1" (
     echo [*] Launching Steam Auto-Updater...
     start "" /d "!TARGET_DIR!" "!CLIENT_EXE!"
 )
-
-
