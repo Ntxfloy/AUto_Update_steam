@@ -38,5 +38,19 @@ CREATE TABLE IF NOT EXISTS idempotency_keys (
     PRIMARY KEY (key, pc_id)
 );
 
+-- "Account has no license for this app" — это свойство ПАРЫ (аккаунт, игра),
+-- а не признак битого аккаунта. Раньше такая ошибка помечала аккаунт 'bad',
+-- и одна игра без лицензии (например Call of Duty HQ) выжигала весь пул.
+-- Теперь запоминаем только то, что этому аккаунту не надо больше выдавать
+-- эту игру; для всех остальных игр аккаунт остаётся полностью рабочим.
+CREATE TABLE IF NOT EXISTS account_app_denied (
+    account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    app_id     TEXT    NOT NULL,
+    reason     TEXT,
+    created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    PRIMARY KEY (account_id, app_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_idem_created ON idempotency_keys(created_at);
 CREATE INDEX IF NOT EXISTS idx_accounts_status ON accounts(status, is_f2p);
+CREATE INDEX IF NOT EXISTS idx_denied_app ON account_app_denied(app_id);
