@@ -18,14 +18,24 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/accounts")
 
 # Клиент присылает человекочитаемый error_msg из steamcmd_result_name().
-# Эти ошибки означают, что аккаунт непригоден (неверный пароль, включён
-# Steam Guard, бан, ограниченный аккаунт) — его нельзя выдавать следующему ПК,
-# иначе весь клуб будет по очереди спотыкаться об одну и ту же битую запись.
+# Эти ошибки означают, что непригоден САМ АККАУНТ (неверный пароль,
+# включён Steam Guard, бан) — его нельзя выдавать следующему ПК.
+#
+# ВАЖНО: "no license" здесь быть НЕ ДОЛЖНО. Это не поломка аккаунта,
+# а факт о конкретной игре: аккаунт ею просто не владеет. Раньше один
+# такой тайтл (Call of Duty HQ) проходил по всему пулу и выжигал его целиком.
 BAD_ACCOUNT_MARKERS = (
     "authentication failure",
-    "no license",
     "login failure",
+    "invalid password",
     "steam guard",
+)
+
+# Ошибки вида «этот аккаунт не владеет этой игрой».
+# Аккаунт остаётся рабочим, запоминаем только пару (аккаунт, app_id).
+NO_LICENSE_MARKERS = (
+    "no license",
+    "no subscription",
 )
 
 
@@ -65,22 +75,39 @@ def _is_bad_account_error(error_msg: Optional[str]) -> bool:
     return any(m in low for m in BAD_ACCOUNT_MARKERS)
 
 
+def _is_no_license_error(error_msg: Optional[str]) -> bool:
+    if not error_msg:
+        return False
+    low = error_msg.lower()
+    return any(m in low for m in NO_LICENSE_MARKERS)
+
+
 def _acquire_one(conn: sqlite3.Connection, body: AcquireRequest) -> Optional[sqlite3.Row]:
-    """Атомарный захват свободного аккаунта с retry на race condition."""
+    """Атомарный захват свободного аккаунта с retry на race condition.
+
+    Аккаунты, про которые уже известно, что у них нет лицензии на эту
+    игру, в выборку не попадают — но остаются доступны для всех остальных игр.
+    """
     for _ in range(5):
         if body.steam_id64:
             row = conn.execute(
-                "SELECT id FROM accounts WHERE steam_id64=? AND status='free' LIMIT 1",
-                (body.steam_id64,)
+                "SELECT id FROM accounts "
+                "WHERE steam_id64=? AND status='free' "
+                "  AND id NOT IN (SELECT account_id FROM account_app_denied WHERE app_id=?) "
+                "LIMIT 1",
+                (body.steam_id64, body.app_id)
             ).fetchone()
         else:
             row = conn.execute(
-                "SELECT id FROM accounts WHERE is_f2p=1 AND status='free' "
-                "ORDER BY (last_heartbeat IS NULL) DESC, last_heartbeat ASC LIMIT 1"
+                "SELECT id FROM accounts "
+                "WHERE is_f2p=1 AND status='free' "
+                "  AND id NOT IN (SELECT account_id FROM account_app_denied WHERE app_id=?) "
+                "ORDER BY (last_heartbeat IS NULL) DESC, last_heartbeat ASC LIMIT 1",
+                (body.app_id,)
             ).fetchone()
 
         if not row:
-            return None  # реально свободных нет
+            return None  # реально свободных (и пригодных для этой игры) нет
 
         updated = conn.execute(
             """
@@ -100,6 +127,25 @@ def _acquire_one(conn: sqlite3.Connection, body: AcquireRequest) -> Optional[sql
         # кто-то опередил — пробуем следующий
 
     return None
+
+
+def _no_license_pool_exhausted(conn: sqlite3.Connection, app_id: str) -> bool:
+    """True, если свободные аккаунты есть, но все они без лицензии на эту игру.
+
+    В этом случае ретраить бессмысленно: игрой не владеет никто в пуле.
+    """
+    free_total = conn.execute(
+        "SELECT COUNT(*) AS n FROM accounts WHERE status='free' AND is_f2p=1"
+    ).fetchone()["n"]
+    if free_total == 0:
+        return False
+    denied = conn.execute(
+        "SELECT COUNT(*) AS n FROM accounts a "
+        "WHERE a.status='free' AND a.is_f2p=1 "
+        "  AND a.id IN (SELECT account_id FROM account_app_denied WHERE app_id=?)",
+        (app_id,)
+    ).fetchone()["n"]
+    return denied >= free_total
 
 
 def _replay_idempotent(conn: sqlite3.Connection, body: AcquireRequest) -> dict:
@@ -170,13 +216,27 @@ def acquire_account(body: AcquireRequest):
         try:
             updated = _acquire_one(conn, body)
             if not updated:
+                # Различаем две разные ситуации:
+                #  409 — все заняты, имеет смысл подождать и повторить;
+                #  410 — игрой не владеет ни один аккаунт пула, ретраить бессмысленно.
+                no_license_everywhere = _no_license_pool_exhausted(conn, body.app_id)
+                http_status = 410 if no_license_everywhere else 409
+                detail = (
+                    f"Ни один аккаунт пула не владеет игрой {body.app_id} — повторы бессмысленны"
+                    if no_license_everywhere else "Нет свободных аккаунтов"
+                )
+                if no_license_everywhere:
+                    logger.warning(
+                        "app_id=%s: в пуле нет ни одного аккаунта с лицензией (pc_id=%s)",
+                        body.app_id, body.pc_id
+                    )
                 conn.execute(
-                    "UPDATE idempotency_keys SET status='failed', http_status=409 "
+                    "UPDATE idempotency_keys SET status='failed', http_status=? "
                     "WHERE key=? AND pc_id=?",
-                    (body.idempotency_key, body.pc_id)
+                    (http_status, body.idempotency_key, body.pc_id)
                 )
                 conn.commit()
-                raise HTTPException(status_code=409, detail="Нет свободных аккаунтов")
+                raise HTTPException(status_code=http_status, detail=detail)
 
             # Расшифровываем ДО коммита — при ошибке откатим
             try:
@@ -242,11 +302,14 @@ def heartbeat(body: HeartbeatRequest):
 def release_account(body: ReleaseRequest):
     conn: sqlite3.Connection = get_conn()
     try:
-        bad_credentials = (body.result == "failed" and _is_bad_account_error(body.error_msg))
+        failed = (body.result == "failed")
+        no_license = failed and _is_no_license_error(body.error_msg)
+        # Нет лицензии — аккаунт исправен, проблема только в этой игре.
+        bad_credentials = failed and not no_license and _is_bad_account_error(body.error_msg)
 
         # Освобождаем ТОЛЬКО свою аренду (lease_token И leased_to_pc).
-        # Если аккаунт не пустил — он не возвращается в пул, а помечается 'bad',
-        # чтобы следующий acquire выдал другой логин.
+        # Если аккаунт не пустил по самой авторизации — он не возвращается
+        # в пул, а помечается 'bad', чтобы следующий acquire выдал другой логин.
         new_status = "bad" if bad_credentials else "free"
         row = conn.execute(
             "UPDATE accounts SET status=?, lease_token=NULL, leased_to_pc=NULL "
@@ -272,6 +335,20 @@ def release_account(body: ReleaseRequest):
                     "UPDATE accounts SET status='bad' WHERE id=? AND status='free'",
                     (account_id,)
                 )
+
+        # Запоминаем пару (аккаунт, игра): больше не выдаём этот аккаунт
+        # под эту игру, но сам аккаунт остаётся в пуле для всего остального.
+        if no_license and account_id is not None:
+            conn.execute(
+                "INSERT OR IGNORE INTO account_app_denied(account_id, app_id, reason) "
+                "VALUES (?, ?, ?)",
+                (account_id, body.app_id, (body.error_msg or "no license")[:200])
+            )
+            logger.info(
+                "Аккаунт id=%s не владеет app_id=%s — исключён только для этой игры "
+                "(pc_id=%s, статус остался free)",
+                account_id, body.app_id, body.pc_id
+            )
 
         if bad_credentials and account_id is not None:
             logger.warning(
@@ -307,7 +384,12 @@ def release_account(body: ReleaseRequest):
             )
 
         conn.commit()
-        return {"ok": True, "released": bool(row), "account_disabled": bad_credentials}
+        return {
+            "ok": True,
+            "released": bool(row),
+            "account_disabled": bad_credentials,
+            "app_denied": no_license,
+        }
     finally:
         conn.close()
 
@@ -322,8 +404,8 @@ def accounts_status():
         return [
             {
                 "id": r["id"],
-                "login": r["login"],
                 "status": r["status"],
+                "login": r["login"],
                 "leased_to_pc": r["leased_to_pc"],
                 "last_heartbeat": r["last_heartbeat"],
                 "is_f2p": bool(r["is_f2p"]),
