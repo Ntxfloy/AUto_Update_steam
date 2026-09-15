@@ -5,206 +5,439 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Steam Club — панель админа</title>
 <style>
-  :root{
-    --bg:#18181b; --panel:#202024; --panel2:#26262b; --border:#3a3a40;
-    --text:#ebebf0; --dim:#9a9aa4; --accent:#3b82f6; --accent2:#60a5fa;
-    --ok:#22c55e; --warn:#eab308; --fail:#ef4444;
-    --wrap:1200px;
-  }
-  *{box-sizing:border-box}
-  body{margin:0;background:var(--bg);color:var(--text);min-height:100vh;
-    overflow-x:hidden;font:14px/1.5 "Segoe UI",system-ui,sans-serif}
-  /* The bars span the full width, their contents stay in one centred column,
-     otherwise on a 2560px monitor the login box flies off to the far right. */
-  header{background:var(--panel);border-bottom:1px solid var(--border);
-    position:sticky;top:0;z-index:10;width:100%}
-  .header-inner{display:flex;align-items:center;gap:16px;padding:14px 22px;
-    max-width:var(--wrap);margin:0 auto;width:100%;flex-wrap:wrap}
-  h1{font-size:16px;margin:0;font-weight:600}
-  .spacer{flex:1}
-  .tabs-bar{background:var(--panel);border-bottom:1px solid var(--border);width:100%}
-  .tabs{display:flex;gap:4px;padding:0 22px;max-width:var(--wrap);margin:0 auto;
-    width:100%;flex-wrap:wrap}
-  .tab{padding:10px 16px;cursor:pointer;color:var(--dim);
-    border-bottom:2px solid transparent;user-select:none}
-  .tab:hover{color:var(--text)}
-  .tab.active{color:var(--text);border-bottom-color:var(--accent)}
-  main{padding:22px;max-width:var(--wrap);margin:0 auto;width:100%}
-  .page{display:none} .page.active{display:block}
-  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:22px}
-  .card{background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:14px 16px}
-  .card .v{font-size:26px;font-weight:600}
-  .card .l{color:var(--dim);font-size:12px;text-transform:uppercase;letter-spacing:.5px}
-  /* Wide rows scroll inside their own box instead of stretching the page. */
-  .table-wrap{width:100%;overflow-x:auto;border:1px solid var(--border);
-    border-radius:14px;background:var(--panel)}
-  table{width:100%;border-collapse:collapse;background:var(--panel);min-width:640px}
-  th{text-align:left;padding:10px 12px;background:var(--panel2);color:var(--dim);
-    font-size:12px;text-transform:uppercase;letter-spacing:.4px;font-weight:600;
-    position:sticky;top:0}
-  td{padding:9px 12px;border-top:1px solid var(--border);vertical-align:middle}
-  tr:hover td{background:#2a2a30}
-  .pill{display:inline-block;padding:2px 9px;border-radius:99px;font-size:12px;font-weight:600}
-  .s-free{background:rgba(34,197,94,.15);color:var(--ok)}
-  .s-busy{background:rgba(59,130,246,.15);color:var(--accent2)}
-  .s-bad{background:rgba(239,68,68,.15);color:var(--fail)}
-  .s-disabled{background:rgba(154,154,164,.15);color:var(--dim)}
-  button{background:var(--panel2);color:var(--text);border:1px solid var(--border);
-    border-radius:10px;padding:8px 14px;cursor:pointer;font:inherit;transition:.12s}
-  button:hover{background:#32323a;border-color:#4a4a52}
-  button.primary{background:var(--accent);border-color:var(--accent);font-weight:600}
-  button.primary:hover{background:var(--accent2);border-color:var(--accent2)}
-  button.danger:hover{background:rgba(239,68,68,.18);border-color:var(--fail);color:#fca5a5}
-  button.sm{padding:4px 9px;font-size:12px;border-radius:8px}
-  button:disabled{opacity:.45;cursor:not-allowed}
-  input,textarea,select{background:#1c1c20;color:var(--text);border:1px solid var(--border);
-    border-radius:10px;padding:9px 11px;font:inherit;width:100%;max-width:100%}
-  input:focus,textarea:focus{outline:none;border-color:var(--accent)}
-  textarea{min-height:230px;font-family:Consolas,monospace;font-size:13px;resize:vertical}
-  label{display:block;color:var(--dim);font-size:12px;margin:0 0 5px}
-  .row{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-bottom:14px}
-  pre{background:#141417;border:1px solid var(--border);border-radius:14px;padding:14px;
-    overflow:auto;max-height:65vh;font-family:Consolas,monospace;font-size:12.5px;
-    white-space:pre-wrap;word-break:break-word}
-  .hint{color:var(--dim);font-size:12.5px}
-  .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:7px}
-  .dot.on{background:var(--ok)} .dot.off{background:var(--fail)}
-  #keyBox{display:flex;gap:8px;align-items:center;max-width:420px}
-  #keyBox input{width:230px}
-  .toast{position:fixed;right:18px;bottom:18px;background:var(--panel);
-    border:1px solid var(--border);border-left:3px solid var(--accent);
-    border-radius:10px;padding:12px 16px;max-width:400px;box-shadow:0 8px 24px #0008;
-    opacity:0;transform:translateY(10px);transition:.2s;pointer-events:none}
-  .toast.show{opacity:1;transform:none}
-  .toast.err{border-left-color:var(--fail)}
-  .toast.ok{border-left-color:var(--ok)}
-  .stale{color:var(--warn)}
-  @media (max-width:760px){
-    .header-inner{padding:12px 14px}
-    .tabs{padding:0 10px}
-    main{padding:14px}
-    #keyBox{width:100%;max-width:none}
-    #keyBox input{width:100%}
-  }
+/* ===========================================================================
+   Tier 1 — primitives. В разметке напрямую не используются.
+   Все пары проверены расчётом: текст >= 4.5:1, границы контролов >= 3:1.
+   =========================================================================== */
+:root{
+  --gray-1000:#0b0b0e; --gray-950:#101014; --gray-900:#16161a; --gray-850:#1c1c21;
+  --gray-800:#22222a;  --gray-750:#2a2a33; --gray-700:#343440; --gray-500:#68687f;
+  --gray-400:#9b9bab;  --gray-300:#b9b9c6; --gray-100:#e8e8ef; --white:#ffffff;
+
+  --blue-700:#1d4ed8; --blue-650:#2560e0; --blue-600:#2563eb; --blue-550:#2f6df0;
+  --blue-400:#7aa7f8; --blue-950:#14213d;
+  --green-400:#5fd98b; --green-950:#10261a;
+  --amber-400:#f0c250; --amber-950:#2b2211;
+  --red-400:#f28b8b;   --red-600:#dc2626;  --red-950:#2d1417;
+
+  --font-ui:"Segoe UI",system-ui,-apple-system,sans-serif;
+  --font-mono:"Cascadia Mono",Consolas,"SF Mono",monospace;
+
+/* ===========================================================================
+   Tier 2 — semantic.
+   =========================================================================== */
+  --surface-sunken:var(--gray-1000);
+  --surface-base:var(--gray-950);
+  --surface-raised:var(--gray-900);
+  --surface-overlay:var(--gray-850);
+  --surface-hover:var(--gray-800);
+  --surface-selected:var(--blue-950);
+
+  --border-separator:var(--gray-750);   /* декоративные разделители */
+  --border-interactive:var(--gray-500); /* границы контролов, 3.5:1 к фону */
+
+  --text-primary:var(--gray-100);
+  --text-secondary:var(--gray-400);
+  --text-on-action:var(--white);
+
+  --action-primary:var(--blue-600);
+  --action-primary-hover:var(--blue-550);
+  --action-primary-active:var(--blue-650);
+  --action-destructive:var(--red-600);
+  --action-destructive-fg:var(--red-400);
+
+  --status-ok-fg:var(--green-400);    --status-ok-bg:var(--green-950);
+  --status-busy-fg:var(--blue-400);   --status-busy-bg:var(--blue-950);
+  --status-warn-fg:var(--amber-400);  --status-warn-bg:var(--amber-950);
+  --status-fail-fg:var(--red-400);    --status-fail-bg:var(--red-950);
+  --status-idle-fg:var(--gray-300);   --status-idle-bg:var(--gray-800);
+
+  --focus-ring:0 0 0 2px var(--surface-base),0 0 0 4px var(--blue-400);
+  --elevation-overlay:0 12px 32px -10px rgba(0,0,0,.7);
+
+  --text-xs:12px; --text-sm:13px; --text-base:14px; --text-lg:17px;
+  --text-2xl:22px; --text-5xl:46px;
+  --leading-tight:1.05; --leading-body:1.55;
+  --tracking-label:.07em; --tracking-display:-.025em;
+
+  --space-1:4px; --space-2:8px; --space-3:12px; --space-4:16px;
+  --space-5:22px; --space-6:32px; --space-7:48px;
+
+  --radius-sm:8px; --radius-md:10px; --radius-lg:14px; --radius-pill:999px;
+
+  --dur-fast:110ms; --dur-base:170ms;
+  --ease-out:cubic-bezier(.2,.8,.3,1);
+
+  --layout-wrap:1240px;
+  --control-h:38px; --control-h-sm:28px;
+
+/* ===========================================================================
+   Tier 3 — component tokens.
+   =========================================================================== */
+  --button-neutral-bg:var(--gray-800);
+  --button-neutral-bg-hover:var(--gray-750);
+  --button-neutral-bg-active:var(--gray-700);
+  --field-bg:var(--gray-1000);
+  --table-head-bg:var(--gray-850);
+  --table-row-hover:var(--gray-850);
+}
+
+*{box-sizing:border-box}
+html,body{margin:0;padding:0}
+body{
+  background:var(--surface-base);color:var(--text-primary);
+  font:var(--text-base)/var(--leading-body) var(--font-ui);
+  min-height:100vh;overflow-x:hidden;-webkit-font-smoothing:antialiased;
+  display:flex;flex-direction:column}
+
+/* Иконки — lucide, inline SVG, currentColor. Эмодзи в интерфейсе нет ни одного. */
+.ic{width:16px;height:16px;flex:none;stroke:currentColor;fill:none;stroke-width:2;
+  stroke-linecap:round;stroke-linejoin:round;vertical-align:-3px}
+.ic-lg{width:20px;height:20px;vertical-align:-4px}
+.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;
+  clip:rect(0 0 0 0);white-space:nowrap;border:0}
+
+a:focus-visible,button:focus-visible,input:focus-visible,select:focus-visible,
+textarea:focus-visible,[tabindex]:focus-visible{outline:none;box-shadow:var(--focus-ring)}
+
+/* --- Каркас -------------------------------------------------------------- */
+.app-header{background:var(--surface-raised);border-bottom:1px solid var(--border-separator);
+  position:sticky;top:0;z-index:20}
+.header-inner,.tabs,.main-inner,.footer-inner{max-width:var(--layout-wrap);margin:0 auto;width:100%}
+.header-inner{display:flex;align-items:center;gap:var(--space-4);
+  padding:var(--space-3) var(--space-5);flex-wrap:wrap}
+.brand{display:flex;align-items:center;gap:var(--space-2);font-size:var(--text-lg);
+  font-weight:600;margin:0;letter-spacing:var(--tracking-display)}
+.brand .ic{color:var(--text-secondary)}
+.health{display:flex;align-items:center;gap:var(--space-2);color:var(--text-secondary);
+  font-size:var(--text-sm);min-inline-size:0}
+.health.is-ok{color:var(--status-ok-fg)}
+.health.is-down{color:var(--status-fail-fg)}
+.spacer{flex:1 1 auto}
+.key-box{display:flex;gap:var(--space-2);align-items:center;min-inline-size:0}
+.key-box input{inline-size:230px}
+
+.tabs-bar{background:var(--surface-raised);border-bottom:1px solid var(--border-separator)}
+.tabs{display:flex;gap:var(--space-1);padding:0 var(--space-5);flex-wrap:wrap}
+.tab{appearance:none;background:none;border:0;border-bottom:2px solid transparent;
+  color:var(--text-secondary);font:inherit;padding:var(--space-3) var(--space-4);
+  cursor:pointer;min-block-size:44px;border-radius:var(--radius-sm) var(--radius-sm) 0 0;
+  transition:color var(--dur-fast) var(--ease-out),background var(--dur-fast) var(--ease-out)}
+.tab:hover{color:var(--text-primary);background:var(--surface-hover)}
+.tab:active{background:var(--button-neutral-bg-active)}
+.tab[aria-selected="true"]{color:var(--text-primary);border-bottom-color:var(--action-primary)}
+
+main{flex:1 0 auto;padding:var(--space-6) var(--space-5) var(--space-7)}
+.page[hidden]{display:none}
+
+.app-footer{border-top:1px solid var(--border-separator);background:var(--surface-raised)}
+.footer-inner{padding:var(--space-4) var(--space-5);color:var(--text-secondary);
+  font-size:var(--text-xs);display:flex;gap:var(--space-4);flex-wrap:wrap}
+
+/* --- Обзор: один ведущий показатель, а не пять равных карточек ----- */
+.lead{display:grid;grid-template-columns:minmax(0,7fr) minmax(0,5fr);gap:var(--space-4);
+  margin-block-end:var(--space-6)}
+.lead-card{background:var(--surface-raised);border:1px solid var(--border-separator);
+  border-radius:var(--radius-lg);padding:var(--space-5) var(--space-6)}
+.eyebrow{margin:0;color:var(--text-secondary);font-size:var(--text-xs);
+  text-transform:uppercase;letter-spacing:var(--tracking-label)}
+.lead-value{margin:var(--space-2) 0 0;font-size:var(--text-5xl);line-height:var(--leading-tight);
+  letter-spacing:var(--tracking-display);font-weight:600;font-variant-numeric:tabular-nums}
+.lead-sub{margin:var(--space-2) 0 0;color:var(--text-secondary);font-size:var(--text-sm)}
+.stat-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:var(--space-4)}
+.stat{background:var(--surface-raised);border:1px solid var(--border-separator);
+  border-radius:var(--radius-lg);padding:var(--space-4)}
+.stat .v{font-size:var(--text-2xl);font-weight:600;font-variant-numeric:tabular-nums;
+  margin-block-start:var(--space-1)}
+.v-busy{color:var(--status-busy-fg)} .v-fail{color:var(--status-fail-fg)}
+
+.section-head{display:flex;align-items:center;gap:var(--space-3);flex-wrap:wrap;
+  margin-block-end:var(--space-3)}
+.section-head h2{font-size:var(--text-base);margin:0;font-weight:600}
+
+/* --- Таблицы ------------------------------------------------------------- */
+.table-wrap{position:relative;border:1px solid var(--border-separator);
+  border-radius:var(--radius-lg);background:var(--surface-raised);overflow:hidden}
+.table-scroll{overflow-x:auto;max-inline-size:100%}
+/* Видимая подсказка, что таблица ещё прокручивается вправо. */
+.table-wrap::after{content:"";position:absolute;inset-block:0;inset-inline-end:0;inline-size:28px;
+  background:linear-gradient(90deg,transparent,var(--surface-raised));pointer-events:none}
+table{inline-size:100%;border-collapse:collapse;min-inline-size:640px}
+th{text-align:start;padding:var(--space-3);background:var(--table-head-bg);
+  color:var(--text-secondary);font-size:var(--text-xs);text-transform:uppercase;
+  letter-spacing:var(--tracking-label);font-weight:600;position:sticky;top:0;z-index:1}
+td{padding:var(--space-3);border-top:1px solid var(--border-separator);vertical-align:middle;
+  overflow-wrap:anywhere}
+tbody tr:hover td{background:var(--table-row-hover)}
+td.num{font-variant-numeric:tabular-nums;color:var(--text-secondary)}
+td.actions{text-align:end;white-space:nowrap}
+.empty{padding:var(--space-6);color:var(--text-secondary);text-align:center}
+.empty strong{display:block;color:var(--text-primary);margin-block-end:var(--space-1)}
+
+/* --- Pill ------------------------------------------------------------------ */
+.pill{display:inline-flex;align-items:center;gap:var(--space-1);padding:2px var(--space-2);
+  border-radius:var(--radius-pill);font-size:var(--text-xs);font-weight:600;line-height:1.6}
+.pill .ic{width:13px;height:13px}
+.p-ok{background:var(--status-ok-bg);color:var(--status-ok-fg)}
+.p-busy{background:var(--status-busy-bg);color:var(--status-busy-fg)}
+.p-fail{background:var(--status-fail-bg);color:var(--status-fail-fg)}
+.p-idle{background:var(--status-idle-bg);color:var(--status-idle-fg)}
+.p-warn{background:var(--status-warn-bg);color:var(--status-warn-fg)}
+
+/* --- Кнопки: 8 состояний ---------------------------------------------- */
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:var(--space-2);
+  background:var(--button-neutral-bg);color:var(--text-primary);
+  border:1px solid var(--border-interactive);border-radius:var(--radius-md);
+  block-size:var(--control-h);padding:0 var(--space-4);font:inherit;cursor:pointer;
+  white-space:nowrap;transition:background var(--dur-fast) var(--ease-out),
+  border-color var(--dur-fast) var(--ease-out),transform var(--dur-fast) var(--ease-out)}
+.btn:hover{background:var(--button-neutral-bg-hover)}
+.btn:active{background:var(--button-neutral-bg-active);transform:scale(.98)}
+.btn[disabled],.btn[aria-disabled="true"]{opacity:.5;pointer-events:none}
+.btn[aria-busy="true"]{opacity:1}
+.btn-primary{background:var(--action-primary);border-color:var(--action-primary);
+  color:var(--text-on-action);font-weight:600}
+.btn-primary:hover{background:var(--action-primary-hover);border-color:var(--action-primary-hover)}
+.btn-primary:active{background:var(--action-primary-active);border-color:var(--action-primary-active)}
+.btn-destructive{color:var(--action-destructive-fg);border-color:var(--border-interactive);
+  background:transparent}
+.btn-destructive:hover{background:var(--status-fail-bg);border-color:var(--action-destructive)}
+.btn-destructive:active{background:var(--status-fail-bg);border-color:var(--action-destructive);
+  transform:scale(.98)}
+.btn-sm{block-size:var(--control-h-sm);padding:0 var(--space-3);font-size:var(--text-xs);
+  border-radius:var(--radius-sm)}
+.spinner{width:14px;height:14px;border-radius:50%;flex:none;
+  border:2px solid currentColor;border-top-color:transparent;animation:spin 700ms linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+/* --- Поля -------------------------------------------------------------- */
+input,select,textarea{background:var(--field-bg);color:var(--text-primary);
+  border:1px solid var(--border-interactive);border-radius:var(--radius-md);
+  padding:0 var(--space-3);font:inherit;inline-size:100%;min-inline-size:0;
+  block-size:var(--control-h)}
+input[type=file]{padding:var(--space-1) var(--space-2);block-size:auto;min-block-size:var(--control-h)}
+input[type=checkbox]{inline-size:18px;block-size:18px;min-block-size:0;accent-color:var(--action-primary)}
+textarea{min-block-size:230px;block-size:auto;padding:var(--space-3);
+  font-family:var(--font-mono);font-size:var(--text-sm);resize:vertical}
+input:hover,select:hover,textarea:hover{border-color:var(--text-secondary)}
+input[aria-invalid="true"]{border-color:var(--action-destructive)}
+.field-error{color:var(--status-fail-fg);font-size:var(--text-xs);margin-block-start:var(--space-1)}
+.check{display:inline-flex;align-items:center;gap:var(--space-2);min-block-size:var(--control-h);
+  cursor:pointer}
+.check input{inline-size:18px}
+.toolbar{display:flex;gap:var(--space-3);align-items:start;flex-wrap:wrap;
+  margin-block-end:var(--space-4)}
+.toolbar .grow{flex:1 1 auto}
+.w-filter{max-inline-size:260px}
+.w-select{max-inline-size:190px}
+.hint{color:var(--text-secondary);font-size:var(--text-sm);max-inline-size:72ch}
+pre{background:var(--surface-sunken);border:1px solid var(--border-separator);
+  border-radius:var(--radius-lg);padding:var(--space-4);overflow:auto;max-block-size:62vh;
+  font-family:var(--font-mono);font-size:var(--text-sm);white-space:pre-wrap;
+  overflow-wrap:anywhere;margin:0}
+
+/* --- Toast: иконка + текст, без цветной полоски слева ---------------- */
+.toast{position:fixed;inset-inline-end:var(--space-4);inset-block-end:var(--space-4);
+  display:flex;gap:var(--space-2);align-items:flex-start;background:var(--surface-overlay);
+  border:1px solid var(--border-interactive);border-radius:var(--radius-md);
+  padding:var(--space-3) var(--space-4);max-inline-size:min(24rem,calc(100vw - 2*var(--space-4)));
+  box-shadow:var(--elevation-overlay);opacity:0;transform:translateY(10px);
+  transition:opacity var(--dur-base) var(--ease-out),transform var(--dur-base) var(--ease-out);
+  pointer-events:none;z-index:40}
+.toast.is-shown{opacity:1;transform:none}
+.toast .ic{margin-block-start:2px}
+.toast.is-ok .ic{color:var(--status-ok-fg)}
+.toast.is-err .ic{color:var(--status-fail-fg)}
+
+@media (max-width:860px){
+  .lead{grid-template-columns:minmax(0,1fr)}
+}
+@media (max-width:560px){
+  .header-inner,.tabs,.footer-inner{padding-inline:var(--space-3)}
+  main{padding:var(--space-4) var(--space-3) var(--space-6)}
+  .key-box{inline-size:100%}
+  .key-box input{inline-size:100%}
+  .w-filter,.w-select{max-inline-size:none}
+  .toolbar>*{flex:1 1 100%}
+}
+@media (prefers-reduced-motion:reduce){
+  *{transition-duration:1ms !important;animation-duration:1ms !important;
+    animation-iteration-count:1 !important}
+  .toast{transform:none}
+}
 </style>
 </head>
 <body>
-<header>
+
+<svg width="0" height="0" aria-hidden="true" focusable="false" style="position:absolute">
+  <symbol id="i-gamepad" viewBox="0 0 24 24"><line x1="6" x2="10" y1="11" y2="11"/><line x1="8" x2="8" y1="9" y2="13"/><line x1="15" x2="15.01" y1="12" y2="12"/><line x1="18" x2="18.01" y1="10" y2="10"/><path d="M17.32 5H6.68a4 4 0 0 0-3.978 3.59c-.006.052-.01.101-.017.152C2.604 9.416 2 14.456 2 16a3 3 0 0 0 3 3c1 0 1.5-.5 2-1l1.414-1.414A2 2 0 0 1 9.828 16h4.344a2 2 0 0 1 1.414.586L17 18c.5.5 1 1 2 1a3 3 0 0 0 3-3c0-1.544-.604-6.584-.685-7.258-.007-.05-.011-.1-.017-.152A4 4 0 0 0 17.32 5z"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></symbol>
+  <symbol id="i-check-circle" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="m9 12 2 2 4-4"/></symbol>
+  <symbol id="i-x-circle" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="m15 9-6 6"/><path d="m9 9 6 6"/></symbol>
+  <symbol id="i-alert" viewBox="0 0 24 24"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3"/><path d="M12 9v4"/><path d="M12 17h.01"/></symbol>
+  <symbol id="i-minus" viewBox="0 0 24 24"><path d="M5 12h14"/></symbol>
+  <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/><path d="M21 21v-5h-5"/></symbol>
+  <symbol id="i-rotate" viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></symbol>
+  <symbol id="i-trash" viewBox="0 0 24 24"><path d="M3 6h18"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" x2="10" y1="11" y2="17"/><line x1="14" x2="14" y1="11" y2="17"/></symbol>
+  <symbol id="i-ban" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="m4.9 4.9 14.2 14.2"/></symbol>
+  <symbol id="i-login" viewBox="0 0 24 24"><path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/><polyline points="10 17 15 12 10 7"/><line x1="15" x2="3" y1="12" y2="12"/></symbol>
+  <symbol id="i-upload" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" x2="12" y1="3" y2="15"/></symbol>
+  <symbol id="i-unlock" viewBox="0 0 24 24"><rect width="18" height="11" x="3" y="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 9.9-1"/></symbol>
+  <symbol id="i-dot" viewBox="0 0 24 24"><circle cx="12" cy="12" r="5" fill="currentColor" stroke="none"/></symbol>
+  <symbol id="i-filter" viewBox="0 0 24 24"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></symbol>
+</svg>
+
+<header class="app-header">
   <div class="header-inner">
-    <h1>🎮 Steam Club — панель админа</h1>
-    <span class="hint"><span id="hDot" class="dot off"></span><span id="hText">проверка…</span></span>
-    <div class="spacer"></div>
-    <div id="keyBox">
-      <input id="apiKey" type="password" placeholder="API ключ (STEAM_API_KEY)" autocomplete="off">
-      <button class="primary" onclick="saveKey()">Войти</button>
+    <h1 class="brand"><svg class="ic ic-lg"><use href="#i-gamepad"/></svg>Steam Club</h1>
+    <p class="health" id="health"><svg class="ic" id="hIcon"><use href="#i-dot"/></svg><span id="hText">проверка связи</span></p>
+    <span class="spacer"></span>
+    <div class="key-box">
+      <label class="sr-only" for="apiKey">API ключ</label>
+      <input id="apiKey" type="password" placeholder="API ключ" autocomplete="off">
+      <button class="btn btn-primary" id="btnLogin" onclick="saveKey()"><svg class="ic"><use href="#i-login"/></svg>Войти</button>
     </div>
   </div>
 </header>
 
 <div class="tabs-bar">
-  <div class="tabs">
-    <div class="tab active" data-p="overview">Обзор</div>
-    <div class="tab" data-p="accounts">Аккаунты</div>
-    <div class="tab" data-p="bulk">Добавить пачкой</div>
-    <div class="tab" data-p="log">Журнал обновлений</div>
-    <div class="tab" data-p="srvlog">Лог сервера</div>
+  <div class="tabs" role="tablist" aria-label="Разделы панели">
+    <button class="tab" role="tab" id="t-overview" data-p="overview" aria-selected="true" aria-controls="p-overview">Обзор</button>
+    <button class="tab" role="tab" id="t-accounts" data-p="accounts" aria-selected="false" aria-controls="p-accounts">Аккаунты</button>
+    <button class="tab" role="tab" id="t-bulk" data-p="bulk" aria-selected="false" aria-controls="p-bulk">Добавить пачкой</button>
+    <button class="tab" role="tab" id="t-log" data-p="log" aria-selected="false" aria-controls="p-log">Журнал обновлений</button>
+    <button class="tab" role="tab" id="t-srvlog" data-p="srvlog" aria-selected="false" aria-controls="p-srvlog">Лог сервера</button>
   </div>
 </div>
 
 <main>
-  <!-- ОБЗОР -->
-  <section id="p-overview" class="page active">
-    <div class="cards">
-      <div class="card"><div class="l">Всего</div><div class="v" id="cTotal">—</div></div>
-      <div class="card"><div class="l">Свободно</div><div class="v" style="color:var(--ok)" id="cFree">—</div></div>
-      <div class="card"><div class="l">В работе</div><div class="v" style="color:var(--accent2)" id="cBusy">—</div></div>
-      <div class="card"><div class="l">Битые</div><div class="v" style="color:var(--fail)" id="cBad">—</div></div>
-      <div class="card"><div class="l">За сутки ✓ / ✗</div><div class="v" id="cDay">—</div></div>
+ <div class="main-inner">
+
+  <section class="page" id="p-overview" role="tabpanel" aria-labelledby="t-overview" tabindex="0">
+    <div class="lead">
+      <div class="lead-card">
+        <p class="eyebrow">Свободных аккаунтов</p>
+        <p class="lead-value" id="cFree">—</p>
+        <p class="lead-sub">из <span id="cTotal">—</span> в пуле. Пока здесь ноль, клиенты ждут в очереди.</p>
+      </div>
+      <div class="stat-grid">
+        <div class="stat"><p class="eyebrow">В работе</p><p class="v v-busy" id="cBusy">—</p></div>
+        <div class="stat"><p class="eyebrow">Битые</p><p class="v v-fail" id="cBad">—</p></div>
+        <div class="stat"><p class="eyebrow">За сутки: успех / ошибки</p><p class="v" id="cDay">—</p></div>
+      </div>
     </div>
-    <div class="row">
-      <strong>Сейчас обновляются</strong>
-      <span class="hint">автообновление каждые 5 сек</span>
-      <div class="spacer"></div>
-      <button class="danger" onclick="forceRelease()">Снять все аренды</button>
+
+    <div class="section-head">
+      <h2>Сейчас обновляются</h2>
+      <span class="hint">Список обновляется каждые 5 секунд</span>
+      <span class="spacer"></span>
+      <button class="btn btn-destructive" onclick="forceRelease()"><svg class="ic"><use href="#i-unlock"/></svg>Снять все аренды</button>
     </div>
-    <div class="table-wrap">
-      <table><thead><tr><th>ПК</th><th>Аккаунт</th><th>Heartbeat</th></tr></thead>
-        <tbody id="pcsBody"><tr><td colspan="3" class="hint">—</td></tr></tbody></table>
-    </div>
+    <div class="table-wrap"><div class="table-scroll">
+      <table>
+        <thead><tr><th scope="col">ПК</th><th scope="col">Аккаунт</th><th scope="col">Последний сигнал</th></tr></thead>
+        <tbody id="pcsBody"></tbody>
+      </table>
+    </div></div>
   </section>
 
-  <!-- АККАУНТЫ -->
-  <section id="p-accounts" class="page">
-    <div class="row">
-      <input id="accFilter" placeholder="Фильтр по логину…" style="max-width:260px" oninput="renderAccounts()">
-      <select id="accStatus" style="max-width:170px" onchange="renderAccounts()">
-        <option value="">Все статусы</option>
-        <option value="free">free</option><option value="busy">busy</option>
-        <option value="bad">bad</option><option value="disabled">disabled</option>
-      </select>
-      <div class="spacer"></div>
-      <button onclick="reviveBad()">Вернуть все битые в пул</button>
-      <button class="primary" onclick="refresh()">Обновить</button>
+  <section class="page" id="p-accounts" role="tabpanel" aria-labelledby="t-accounts" tabindex="0" hidden>
+    <div class="toolbar">
+      <div class="w-filter grow">
+        <label class="sr-only" for="accFilter">Фильтр по логину</label>
+        <input id="accFilter" placeholder="Фильтр по логину" oninput="renderAccounts()">
+      </div>
+      <div class="w-select">
+        <label class="sr-only" for="accStatus">Статус</label>
+        <select id="accStatus" onchange="renderAccounts()">
+          <option value="">Все статусы</option>
+          <option value="free">Свободные</option>
+          <option value="busy">В работе</option>
+          <option value="bad">Битые</option>
+          <option value="disabled">Отключённые</option>
+        </select>
+      </div>
+      <button class="btn" onclick="reviveBad()"><svg class="ic"><use href="#i-rotate"/></svg>Вернуть битые в пул</button>
+      <button class="btn btn-primary" onclick="refresh()"><svg class="ic"><use href="#i-refresh"/></svg>Обновить</button>
     </div>
-    <div class="table-wrap">
-      <table><thead><tr><th style="width:60px">ID</th><th>Логин</th><th style="width:110px">Статус</th>
-        <th style="width:120px">На ПК</th><th style="width:90px">F2P</th><th style="width:220px"></th></tr></thead>
-        <tbody id="accBody"></tbody></table>
-    </div>
+    <div class="table-wrap"><div class="table-scroll">
+      <table>
+        <thead><tr><th scope="col" style="width:64px">ID</th><th scope="col">Логин</th>
+          <th scope="col" style="width:130px">Статус</th><th scope="col" style="width:140px">На ПК</th>
+          <th scope="col" style="width:80px">F2P</th><th scope="col" style="width:250px"><span class="sr-only">Действия</span></th></tr></thead>
+        <tbody id="accBody"></tbody>
+      </table>
+    </div></div>
   </section>
 
-  <!-- ПАЧКОЙ -->
-  <section id="p-bulk" class="page">
-    <p class="hint">Одна строка — один аккаунт. Разделитель любой: <code>login:pass</code>,
-      <code>login,pass</code>, <code>login;pass</code>, табуляция или пробел.
-      Третий столбец (steam_id64) — необязателен. Пароли шифруются на сервере.</p>
-    <div class="row">
-      <input type="file" id="file" accept=".txt,.csv" style="max-width:300px" onchange="loadFile()">
-      <label style="margin:0;display:flex;align-items:center;gap:7px;color:var(--text)">
-        <input type="checkbox" id="isPaid" style="width:auto"> Отметить как платные (не F2P)</label>
-      <label style="margin:0;display:flex;align-items:center;gap:7px;color:var(--text)">
-        <input type="checkbox" id="skipDup" checked style="width:auto"> Пропускать дубликаты</label>
+  <section class="page" id="p-bulk" role="tabpanel" aria-labelledby="t-bulk" tabindex="0" hidden>
+    <p class="hint">Одна строка — один аккаунт. Разделитель любой: двоеточие, запятая, точка с запятой, табуляция или пробел. Третий столбец (steam_id64) необязателен. Пароли шифруются на сервере.</p>
+    <div class="toolbar">
+      <div class="w-filter">
+        <label class="sr-only" for="file">Файл со списком</label>
+        <input type="file" id="file" accept=".txt,.csv" onchange="loadFile()">
+      </div>
+      <label class="check"><input type="checkbox" id="isPaid"> Отметить как платные</label>
+      <label class="check"><input type="checkbox" id="skipDup" checked> Пропускать дубликаты</label>
     </div>
-    <textarea id="bulkText" placeholder="club_acc_01:Passw0rd123&#10;club_acc_02:Passw0rd456&#10;club_acc_03,Passw0rd789,76561199000000000"></textarea>
-    <div class="row" style="margin-top:12px">
+    <label class="sr-only" for="bulkText">Список аккаунтов</label>
+    <textarea id="bulkText" placeholder="club_acc_01:Passw0rd123&#10;club_acc_02,Passw0rd456,76561199000000000"></textarea>
+    <div class="toolbar" style="margin-block-start:var(--space-3)">
       <span class="hint" id="bulkCount">0 строк</span>
-      <div class="spacer"></div>
-      <button onclick="document.getElementById('bulkText').value='';countLines()">Очистить</button>
-      <button class="primary" id="bulkBtn" onclick="bulkAdd()">Загрузить в базу</button>
+      <span class="spacer"></span>
+      <button class="btn" onclick="clearBulk()">Очистить</button>
+      <button class="btn btn-primary" id="bulkBtn" onclick="bulkAdd()"><svg class="ic"><use href="#i-upload"/></svg>Загрузить в базу</button>
     </div>
-    <pre id="bulkResult" style="display:none"></pre>
+    <pre id="bulkResult" hidden></pre>
   </section>
 
-  <!-- ЖУРНАЛ -->
-  <section id="p-log" class="page">
-    <div class="row">
-      <select id="logResult" style="max-width:190px" onchange="loadLog()">
-        <option value="">Все результаты</option>
-        <option value="success">только успешные</option>
-        <option value="error">только ошибки</option>
-      </select>
-      <input id="logPc" placeholder="Фильтр по PC-ID…" style="max-width:200px">
-      <button onclick="loadLog()">Применить</button>
+  <section class="page" id="p-log" role="tabpanel" aria-labelledby="t-log" tabindex="0" hidden>
+    <div class="toolbar">
+      <div class="w-select">
+        <label class="sr-only" for="logResult">Результат</label>
+        <select id="logResult" onchange="loadLog()">
+          <option value="">Все результаты</option>
+          <option value="success">Только успешные</option>
+          <option value="error">Только ошибки</option>
+        </select>
+      </div>
+      <div class="w-filter">
+        <label class="sr-only" for="logPc">Фильтр по PC-ID</label>
+        <input id="logPc" placeholder="Фильтр по PC-ID">
+      </div>
+      <button class="btn" onclick="loadLog()"><svg class="ic"><use href="#i-filter"/></svg>Применить</button>
     </div>
-    <div class="table-wrap">
-      <table><thead><tr><th>ПК</th><th>AppID</th><th>Результат</th><th>Build</th>
-        <th>Ошибка</th><th>Завершено</th></tr></thead>
-        <tbody id="logBody"></tbody></table>
-    </div>
+    <div class="table-wrap"><div class="table-scroll">
+      <table>
+        <thead><tr><th scope="col">ПК</th><th scope="col">AppID</th><th scope="col">Результат</th>
+          <th scope="col">Build</th><th scope="col">Ошибка</th><th scope="col">Завершено</th></tr></thead>
+        <tbody id="logBody"></tbody>
+      </table>
+    </div></div>
   </section>
 
-  <!-- ЛОГ СЕРВЕРА -->
-  <section id="p-srvlog" class="page">
-    <div class="row">
-      <button class="primary" onclick="loadServerLog()">Обновить</button>
-      <label style="margin:0;display:flex;align-items:center;gap:7px;color:var(--text)">
-        <input type="checkbox" id="autoLog" style="width:auto"> Автообновление (3 с)</label>
+  <section class="page" id="p-srvlog" role="tabpanel" aria-labelledby="t-srvlog" tabindex="0" hidden>
+    <div class="toolbar">
+      <button class="btn btn-primary" onclick="loadServerLog()"><svg class="ic"><use href="#i-refresh"/></svg>Обновить</button>
+      <label class="check"><input type="checkbox" id="autoLog"> Автообновление каждые 3 с</label>
     </div>
-    <pre id="srvLogBox">—</pre>
+    <pre id="srvLogBox">Лог ещё не загружен. Нажмите «Обновить».</pre>
   </section>
+
+ </div>
 </main>
 
-<div id="toast" class="toast"></div>
+<footer class="app-footer">
+  <div class="footer-inner">
+    <span>Steam Club Manager</span>
+    <span id="fServer">Сервер: —</span>
+    <span id="fUpdated">Обновлено: —</span>
+  </div>
+</footer>
+
+<div id="toast" class="toast" role="status" aria-live="polite">
+  <svg class="ic" id="toastIcon"><use href="#i-check-circle"/></svg><span id="toastText"></span>
+</div>
 
 <script>
 let KEY = localStorage.getItem("steamAdminKey") || "";
@@ -212,17 +445,44 @@ let DATA = { accounts: [], pcs: [] };
 let timer = null, logTimer = null;
 
 const TABS = ["overview", "accounts", "bulk", "log", "srvlog"];
+const $ = id => document.getElementById(id);
+const icon = name => `<svg class="ic" aria-hidden="true"><use href="#i-${name}"/></svg>`;
 
+// --- Уведомления ----------------------------------------------------------
 function toast(msg, kind){
-  const t = document.getElementById("toast");
-  t.textContent = msg;
-  t.className = "toast show " + (kind || "");
+  const t = $("toast");
+  $("toastText").textContent = msg;
+  $("toastIcon").innerHTML =
+    `<use href="#i-${kind === "err" ? "x-circle" : "check-circle"}"/>`;
+  t.className = "toast is-shown " + (kind === "err" ? "is-err" : "is-ok");
   clearTimeout(t._h);
-  t._h = setTimeout(() => t.className = "toast " + (kind || ""), 4200);
+  t._h = setTimeout(() => { t.className = "toast " + (kind === "err" ? "is-err" : "is-ok"); }, 4200);
+}
+
+// Состояние loading — кнопка не гаснет, а меняет содержимое на спиннер.
+function setBusy(btn, busy, labelHtml){
+  if (!btn) return;
+  if (busy){
+    btn._html = btn.innerHTML;
+    btn.setAttribute("aria-busy", "true");
+    btn.style.pointerEvents = "none";
+    btn.innerHTML = '<span class="spinner"></span>' + (labelHtml || "Загрузка");
+  } else {
+    btn.removeAttribute("aria-busy");
+    btn.style.pointerEvents = "";
+    if (btn._html) btn.innerHTML = btn._html;
+  }
 }
 
 function saveKey(){
-  KEY = document.getElementById("apiKey").value.trim();
+  const field = $("apiKey");
+  KEY = field.value.trim();
+  if (!KEY){
+    field.setAttribute("aria-invalid", "true");
+    toast("Введите API ключ из STEAM_API_KEY в .env сервера", "err");
+    return;
+  }
+  field.removeAttribute("aria-invalid");
   localStorage.setItem("steamAdminKey", KEY);
   refresh();
 }
@@ -235,9 +495,9 @@ async function api(path, opts){
     opts.body = JSON.stringify(opts.body);
   }
   const r = await fetch(path, opts);
-  if (r.status === 401) { setHealth(false, "неверный API ключ"); throw new Error("Неверный API ключ"); }
+  if (r.status === 401){ setHealth(false, "неверный API ключ"); throw new Error("Неверный API ключ"); }
   if (!r.ok){
-    let d = "HTTP " + r.status;
+    let d = "Сервер ответил HTTP " + r.status;
     try { const j = await r.json(); if (j.detail) d = j.detail; } catch(e){}
     throw new Error(d);
   }
@@ -246,8 +506,11 @@ async function api(path, opts){
 }
 
 function setHealth(ok, text){
-  document.getElementById("hDot").className = "dot " + (ok ? "on" : "off");
-  document.getElementById("hText").textContent = text;
+  const el = $("health");
+  el.className = "health " + (ok ? "is-ok" : "is-down");
+  $("hIcon").innerHTML = `<use href="#i-${ok ? "dot" : "alert"}"/>`;
+  $("hText").textContent = text;
+  $("fServer").textContent = "Сервер: " + (ok ? "онлайн" : text);
 }
 
 function esc(s){
@@ -262,46 +525,71 @@ function ago(sec){
 }
 function ts(unix){ return unix ? new Date(unix*1000).toLocaleString("ru-RU") : "—"; }
 
+const STATUS_META = {
+  free:     { cls:"p-ok",   ic:"check",    text:"Свободен" },
+  busy:     { cls:"p-busy", ic:"refresh",  text:"В работе" },
+  bad:      { cls:"p-fail", ic:"alert",    text:"Битый" },
+  disabled: { cls:"p-idle", ic:"ban",      text:"Отключён" }
+};
+function statusPill(status){
+  const m = STATUS_META[status] || { cls:"p-idle", ic:"minus", text: status };
+  return `<span class="pill ${m.cls}">${icon(m.ic)}${esc(m.text)}</span>`;
+}
+function emptyRow(cols, title, hintText){
+  return `<tr><td colspan="${cols}"><div class="empty"><strong>${esc(title)}</strong>${esc(hintText)}</div></td></tr>`;
+}
+
 async function refresh(){
   if (!KEY){ setHealth(false, "введите API ключ"); return; }
   try {
     const d = await api("/admin/api/overview");
     DATA = d;
     setHealth(true, "сервер онлайн");
-    document.getElementById("cTotal").textContent = d.counts.total;
-    document.getElementById("cFree").textContent  = d.counts.free;
-    document.getElementById("cBusy").textContent  = d.counts.busy;
-    document.getElementById("cBad").textContent   = d.counts.bad;
+    $("cTotal").textContent = d.counts.total;
+    $("cFree").textContent  = d.counts.free;
+    $("cBusy").textContent  = d.counts.busy;
+    $("cBad").textContent   = d.counts.bad;
     const s = d.last_24h.success || 0, e = d.last_24h.error || 0;
-    document.getElementById("cDay").textContent = s + " / " + e;
+    $("cDay").textContent = s + " / " + e;
+    $("fUpdated").textContent = "Обновлено: " + new Date().toLocaleTimeString("ru-RU");
 
-    document.getElementById("pcsBody").innerHTML = d.pcs.length
-      ? d.pcs.map(p => `<tr><td><b>${esc(p.pc_id)}</b></td><td>${esc(p.login)} <span class="hint">#${p.account_id}</span></td>
-          <td class="${p.stale ? "stale" : ""}">${ago(p.idle_sec)}${p.stale ? " ⚠ нет связи" : ""}</td></tr>`).join("")
-      : '<tr><td colspan="3" class="hint">Сейчас ничего не обновляется</td></tr>';
+    $("pcsBody").innerHTML = d.pcs.length
+      ? d.pcs.map(p => `<tr>
+          <td><b>${esc(p.pc_id)}</b></td>
+          <td>${esc(p.login)} <span class="hint">#${p.account_id}</span></td>
+          <td>${p.stale
+              ? `<span class="pill p-warn">${icon("alert")}нет связи, ${esc(ago(p.idle_sec))}</span>`
+              : `<span class="pill p-ok">${icon("check")}${esc(ago(p.idle_sec))}</span>`}</td>
+        </tr>`).join("")
+      : emptyRow(3, "Сейчас ничего не обновляется",
+          "Запустите клиент на любом ПК клуба — аренда появится здесь в течение пяти секунд.");
     renderAccounts();
   } catch(err){ setHealth(false, err.message); }
 }
 
 function renderAccounts(){
-  const f = (document.getElementById("accFilter").value || "").toLowerCase();
-  const st = document.getElementById("accStatus").value;
+  const f = ($("accFilter").value || "").toLowerCase();
+  const st = $("accStatus").value;
   localStorage.setItem("steamAdminAccStatus", st);
   const rows = DATA.accounts.filter(a =>
     (!f || a.login.toLowerCase().includes(f)) && (!st || a.status === st));
-  document.getElementById("accBody").innerHTML = rows.length ? rows.map(a => `
+  $("accBody").innerHTML = rows.length ? rows.map(a => `
     <tr>
-      <td class="hint">${a.id}</td>
+      <td class="num">${a.id}</td>
       <td><b>${esc(a.login)}</b></td>
-      <td><span class="pill s-${esc(a.status)}">${esc(a.status)}</span></td>
+      <td>${statusPill(a.status)}</td>
       <td>${esc(a.leased_to_pc || "—")}</td>
-      <td>${a.is_f2p ? "✓" : "—"}</td>
-      <td style="text-align:right">
-        ${a.status !== "free" ? `<button class="sm" onclick="setStatus(${a.id},'free')">В пул</button>` : ""}
-        ${a.status !== "disabled" ? `<button class="sm" onclick="setStatus(${a.id},'disabled')">Отключить</button>` : ""}
-        <button class="sm danger" onclick="delAccount(${a.id},'${esc(a.login)}')">Удалить</button>
+      <td>${a.is_f2p
+          ? `${icon("check")}<span class="sr-only">да</span>`
+          : `${icon("minus")}<span class="sr-only">нет</span>`}</td>
+      <td class="actions">
+        ${a.status !== "free" ? `<button class="btn btn-sm" onclick="setStatus(${a.id},'free')">В пул</button> ` : ""}
+        ${a.status !== "disabled" ? `<button class="btn btn-sm" onclick="setStatus(${a.id},'disabled')">Отключить</button> ` : ""}
+        <button class="btn btn-sm btn-destructive" onclick="delAccount(${a.id},'${esc(a.login)}')">${icon("trash")}Удалить</button>
       </td>
-    </tr>`).join("") : '<tr><td colspan="6" class="hint">Ничего не найдено</td></tr>';
+    </tr>`).join("")
+    : emptyRow(6, "Ни одного аккаунта по фильтру",
+        "Снимите фильтр или добавьте аккаунты на вкладке «Добавить пачкой».");
 }
 
 async function setStatus(id, status){
@@ -310,9 +598,9 @@ async function setStatus(id, status){
   catch(e){ toast(e.message, "err"); }
 }
 async function delAccount(id, login){
-  if (!confirm(`Удалить аккаунт ${login}?`)) return;
+  if (!confirm(`Удалить аккаунт ${login}? Действие необратимо.`)) return;
   try { await api(`/admin/api/accounts/${id}`, { method:"DELETE" });
-    toast("Удалён", "ok"); refresh(); }
+    toast("Аккаунт удалён", "ok"); refresh(); }
   catch(e){ toast(e.message, "err"); }
 }
 async function reviveBad(){
@@ -328,117 +616,117 @@ async function forceRelease(){
 }
 
 function countLines(){
-  const n = document.getElementById("bulkText").value
-    .split("\n").filter(l => l.trim()).length;
-  document.getElementById("bulkCount").textContent = n + " строк";
+  const n = $("bulkText").value.split("\n").filter(l => l.trim()).length;
+  $("bulkCount").textContent = n + " строк";
 }
+function clearBulk(){ $("bulkText").value = ""; countLines(); }
 function loadFile(){
-  const f = document.getElementById("file").files[0];
+  const f = $("file").files[0];
   if (!f) return;
   const rd = new FileReader();
-  rd.onload = () => { document.getElementById("bulkText").value = rd.result; countLines(); };
+  rd.onload = () => { $("bulkText").value = rd.result; countLines(); };
   rd.readAsText(f, "utf-8");
 }
 async function bulkAdd(){
-  const text = document.getElementById("bulkText").value.trim();
-  if (!text) { toast("Пустой список", "err"); return; }
-  const btn = document.getElementById("bulkBtn");
-  btn.disabled = true; btn.textContent = "Загружаю…";
+  const text = $("bulkText").value.trim();
+  if (!text){ toast("Список пуст. Вставьте строки вида login:password", "err"); return; }
+  const btn = $("bulkBtn");
+  setBusy(btn, true, "Загружаю");
   try {
     const r = await api("/admin/api/accounts/bulk", { method:"POST", body:{
-      text, is_paid: document.getElementById("isPaid").checked,
-      skip_duplicates: document.getElementById("skipDup").checked } });
-    const box = document.getElementById("bulkResult");
-    box.style.display = "block";
+      text, is_paid: $("isPaid").checked, skip_duplicates: $("skipDup").checked } });
+    const box = $("bulkResult");
+    box.hidden = false;
     box.textContent = `Добавлено: ${r.added}\nПропущено: ${r.skipped.length}\n`
       + r.skipped.map(s => `  строка ${s.line}: ${s.text} — ${s.reason}`).join("\n");
-    toast(`Добавлено ${r.added}, пропущено ${r.skipped.length}`,
-      r.added ? "ok" : "err");
-    if (r.added) document.getElementById("bulkText").value = "";
+    toast(`Добавлено ${r.added}, пропущено ${r.skipped.length}`, r.added ? "ok" : "err");
+    if (r.added) $("bulkText").value = "";
     countLines(); refresh();
   } catch(e){ toast(e.message, "err"); }
-  finally { btn.disabled = false; btn.textContent = "Загрузить в базу"; }
+  finally { setBusy(btn, false); }
 }
 
 async function loadLog(){
   const p = new URLSearchParams({ limit: "150" });
-  const r = document.getElementById("logResult").value;
-  const pc = document.getElementById("logPc").value.trim();
+  const r = $("logResult").value;
+  const pc = $("logPc").value.trim();
   localStorage.setItem("steamAdminLogResult", r);
   localStorage.setItem("steamAdminLogPc", pc);
   if (r) p.set("result", r);
   if (pc) p.set("pc_id", pc);
   try {
     const rows = await api("/admin/api/log?" + p);
-    document.getElementById("logBody").innerHTML = rows.length ? rows.map(l => `
-      <tr><td><b>${esc(l.pc_id)}</b></td><td>${esc(l.app_id)}</td>
-        <td><span class="pill ${l.result === "success" ? "s-free" : "s-bad"}">${esc(l.result)}</span></td>
-        <td class="hint">${esc(l.build_id_before || "?")} → ${esc(l.build_id_after || "?")}</td>
-        <td>${esc(l.error_msg || "—")}</td><td class="hint">${ts(l.finished_at)}</td></tr>`).join("")
-      : '<tr><td colspan="6" class="hint">Записей нет</td></tr>';
+    $("logBody").innerHTML = rows.length ? rows.map(l => `
+      <tr><td><b>${esc(l.pc_id)}</b></td><td class="num">${esc(l.app_id)}</td>
+        <td>${l.result === "success"
+            ? `<span class="pill p-ok">${icon("check")}успех</span>`
+            : `<span class="pill p-fail">${icon("alert")}ошибка</span>`}</td>
+        <td class="num">${esc(l.build_id_before || "?")} → ${esc(l.build_id_after || "?")}</td>
+        <td>${esc(l.error_msg || "—")}</td><td class="num">${ts(l.finished_at)}</td></tr>`).join("")
+      : emptyRow(6, "Записей нет",
+          "Журнал заполняется после первого завершённого обновления на любом ПК.");
   } catch(e){ toast(e.message, "err"); }
 }
 
 async function loadServerLog(){
   try {
     const t = await api("/admin/api/server-log?lines=300");
-    const box = document.getElementById("srvLogBox");
-    box.textContent = t;
+    const box = $("srvLogBox");
+    box.textContent = t || "Лог пуст.";
     box.scrollTop = box.scrollHeight;
   } catch(e){ toast(e.message, "err"); }
 }
 
-// --- Tabs ------------------------------------------------------------------
-// The active tab is kept in localStorage AND in the URL hash, so F5 (or a
-// restarted server) puts you back where you were instead of always throwing
-// you to the Overview page.
+// --- Вкладки ------------------------------------------------------------
+// Активная вкладка хранится и в localStorage, и в хэше URL, поэтому F5
+// или перезапуск сервера возвращают туда же, а не на «Обзор».
 function showTab(name, push){
   if (TABS.indexOf(name) < 0) name = "overview";
   document.querySelectorAll(".tab").forEach(x =>
-    x.classList.toggle("active", x.dataset.p === name));
-  document.querySelectorAll(".page").forEach(x => x.classList.remove("active"));
-  const page = document.getElementById("p-" + name);
-  if (page) page.classList.add("active");
+    x.setAttribute("aria-selected", x.dataset.p === name ? "true" : "false"));
+  document.querySelectorAll(".page").forEach(x => { x.hidden = true; });
+  const page = $("p-" + name);
+  if (page) page.hidden = false;
   localStorage.setItem("steamAdminTab", name);
-  if (push && location.hash !== "#" + name){
-    history.replaceState(null, "", "#" + name);
-  }
+  if (push && location.hash !== "#" + name) history.replaceState(null, "", "#" + name);
   if (name === "log") loadLog();
   if (name === "srvlog") loadServerLog();
 }
 
-document.querySelectorAll(".tab").forEach(t =>
-  t.onclick = () => showTab(t.dataset.p, true));
-window.addEventListener("hashchange",
-  () => showTab((location.hash || "").replace("#", ""), false));
+const tabEls = Array.from(document.querySelectorAll(".tab"));
+tabEls.forEach((t, i) => {
+  t.onclick = () => showTab(t.dataset.p, true);
+  t.addEventListener("keydown", e => {
+    let next = null;
+    if (e.key === "ArrowRight") next = tabEls[(i + 1) % tabEls.length];
+    else if (e.key === "ArrowLeft") next = tabEls[(i - 1 + tabEls.length) % tabEls.length];
+    else if (e.key === "Home") next = tabEls[0];
+    else if (e.key === "End") next = tabEls[tabEls.length - 1];
+    if (next){ e.preventDefault(); next.focus(); showTab(next.dataset.p, true); }
+  });
+});
+window.addEventListener("hashchange", () => showTab((location.hash || "").replace("#", ""), false));
 
-document.getElementById("bulkText").addEventListener("input", countLines);
-document.getElementById("apiKey").addEventListener("keydown",
-  e => { if (e.key === "Enter") saveKey(); });
-document.getElementById("logPc").addEventListener("keydown",
-  e => { if (e.key === "Enter") loadLog(); });
-document.getElementById("autoLog").addEventListener("change", e => {
+$("bulkText").addEventListener("input", countLines);
+$("apiKey").addEventListener("keydown", e => { if (e.key === "Enter") saveKey(); });
+$("logPc").addEventListener("keydown", e => { if (e.key === "Enter") loadLog(); });
+$("autoLog").addEventListener("change", e => {
   clearInterval(logTimer);
   localStorage.setItem("steamAdminAutoLog", e.target.checked ? "1" : "0");
   if (e.target.checked) logTimer = setInterval(loadServerLog, 3000);
 });
 
-// --- Restore the previous session -----------------------------------------
-if (KEY) document.getElementById("apiKey").value = KEY;
-document.getElementById("accStatus").value =
-  localStorage.getItem("steamAdminAccStatus") || "";
-document.getElementById("logResult").value =
-  localStorage.getItem("steamAdminLogResult") || "";
-document.getElementById("logPc").value =
-  localStorage.getItem("steamAdminLogPc") || "";
+// --- Восстановление предыдущей сессии --------------------------------
+if (KEY) $("apiKey").value = KEY;
+$("accStatus").value  = localStorage.getItem("steamAdminAccStatus") || "";
+$("logResult").value  = localStorage.getItem("steamAdminLogResult") || "";
+$("logPc").value      = localStorage.getItem("steamAdminLogPc") || "";
 if (localStorage.getItem("steamAdminAutoLog") === "1"){
-  document.getElementById("autoLog").checked = true;
+  $("autoLog").checked = true;
   logTimer = setInterval(loadServerLog, 3000);
 }
 
-showTab((location.hash || "").replace("#", "") ||
-        localStorage.getItem("steamAdminTab") || "overview", true);
-
+showTab((location.hash || "").replace("#", "") || localStorage.getItem("steamAdminTab") || "overview", true);
 refresh();
 timer = setInterval(() => { if (!document.hidden) refresh(); }, 5000);
 </script>
